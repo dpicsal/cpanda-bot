@@ -227,14 +227,7 @@ async def fetch_page_text(path):
     now = datetime.utcnow()
     if path in page_cache['ts'] and now - page_cache['ts'][path] < CACHE_TTL:
         return page_cache['data'][path]
-    content = "Content unavailable."
-    try:
-        async with aiohttp.ClientSession() as session:
-            resp = await session.get(BASE_URL + path)
-            html = await resp.text()
-        soup = BeautifulSoup(html, 'html.parser')
-        paragraphs = [p.get_text(strip=True) for p in soup.find_all('p')]
-        content = "
+    content = "
 
 ".join(paragraphs)
     except Exception as e:
