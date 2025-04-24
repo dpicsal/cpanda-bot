@@ -108,7 +108,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/plans /support /payment /policy /subpolicy /admin /help", reply_markup=MAIN_MENU
     )
 
-# Content commands\async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Content commands
+async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await fetch_site_data()
     text = f"💎 Plan: {data['plan']}\n" + ''.join(f"• {f}\n" for f in data['features']) + "Buy 👉 https://cpanda.app/page/payment"
     await update.message.reply_text(text, reply_markup=BACK_MENU)
