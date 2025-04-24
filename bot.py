@@ -51,8 +51,8 @@ async def fetch_site_data():
 
 # Prompt for ChatGPT
 SYSTEM_PROMPT = (
-    "You are a helpful, friendly support agent for Panda AppStore.
-Answer only Panda AppStore queries and guide unrelated back politely."
+    "You are a helpful, friendly support agent for Panda AppStore. "
+    "Answer only Panda AppStore queries and guide unrelated questions back politely."
 )
 
 # Initialize bot storage
