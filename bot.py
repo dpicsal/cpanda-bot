@@ -3,7 +3,8 @@ import logging
 import aiohttp
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
-from telegram import Update, ChatAction, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     filters, ContextTypes
