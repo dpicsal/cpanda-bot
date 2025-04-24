@@ -286,7 +286,6 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('payment', payment))
     app.add_handler(CommandHandler('policy', policy))
     app.add_handler(CommandHandler('subpolicy', subpolicy))
-    )
     # Callback handler for live replies
     app.add_handler(CallbackQueryHandler(callback_handler))
     # Message handler
