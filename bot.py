@@ -267,10 +267,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text('\n'.join(lines))
 
 # ----------------------- Main Entrypoint -----------------------
+# ----------------------- Main Entrypoint -----------------------
 if __name__ == '__main__':
     import asyncio
     if RAG_ENABLED:
+        # Build RAG index in a fresh event loop
         asyncio.run(scrape_and_build_index())
+    # Reset to a new event loop so run_polling can start its own loop
+    new_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(new_loop)
+
+    # Build and run the Telegram bot
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CallbackQueryHandler(callback_handler))
