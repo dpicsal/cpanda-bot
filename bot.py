@@ -32,20 +32,28 @@ CACHE_TTL = timedelta(hours=1)
 # Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# In-memory caches
+# In-memory storage
 site_cache = {"ts": None, "data": {}}
 page_cache = {"ts": {}, "data": {}}
 
+# Bot persistent data keys: histories, logs, users_info, last_time, banned
+
 # Keyboards
-USER_MAIN_MENU = ReplyKeyboardMarkup([
-    ["Plans", "Support", "Payment"],
-    ["Policy", "Sub Policy", "Help"]
-], resize_keyboard=True)
-ADMIN_MAIN_MENU = ReplyKeyboardMarkup([
-    ["Stats", "List Users", "View Logs"],
-    ["Plans", "Support", "Payment"],
-    ["Policy", "Sub Policy", "Help"]
-], resize_keyboard=True)
+def get_user_menu():
+    return ReplyKeyboardMarkup(
+        [["Plans", "Support", "Payment"],
+         ["Policy", "Sub Policy", "Help"]],
+        resize_keyboard=True
+    )
+
+def get_admin_menu():
+    return ReplyKeyboardMarkup(
+        [["Stats", "List Users", "View User"],
+         ["Plans", "Support", "Payment"],
+         ["Policy", "Sub Policy", "Help"]],
+        resize_keyboard=True
+    )
+
 BACK_MENU = ReplyKeyboardMarkup([["Back"]], resize_keyboard=True)
 REMOVE_MENU = ReplyKeyboardRemove()
 
@@ -54,6 +62,7 @@ def init_bot_data(ctx):
     d = ctx.bot_data
     d.setdefault('histories', {})
     d.setdefault('logs', [])
+    d.setdefault('users_info', {})
     d.setdefault('last_time', {})
     d.setdefault('banned', set())
 
@@ -108,14 +117,21 @@ SYSTEM_PROMPT = (
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_bot_data(context)
     uid = update.effective_user.id
-    menu = ADMIN_MAIN_MENU if uid in ADMIN_IDS else USER_MAIN_MENU
+    # Store user info
+    info = context.bot_data['users_info']
+    info[str(uid)] = {
+        'username': update.effective_user.username,
+        'name': update.effective_user.full_name
+    }
+    menu = get_admin_menu() if uid in ADMIN_IDS else get_user_menu()
     await update.message.reply_text("Welcome! Choose an option:", reply_markup=menu)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    menu = ADMIN_MAIN_MENU if uid in ADMIN_IDS else USER_MAIN_MENU
+    menu = get_admin_menu() if uid in ADMIN_IDS else get_user_menu()
     await update.message.reply_text(
-        "/plans /support /payment /policy /subpolicy /help", reply_markup=menu
+        "/plans /support /payment /policy /subpolicy /view_user /help",
+        reply_markup=menu
     )
 
 async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -128,7 +144,8 @@ async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔗 Contact: https://cpanda.app/contact or @pandastorehelp_bot", reply_markup=BACK_MENU
+        "🔗 Contact: https://cpanda.app/contact or @pandastorehelp_bot",
+        reply_markup=BACK_MENU
     )
 
 async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -142,6 +159,25 @@ async def policy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def subpolicy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await fetch_page_text('/app-plus-subscription-policy')
     await update.message.reply_text(text[:4000], reply_markup=BACK_MENU)
+
+async def view_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        return await update.message.reply_text("🚫 Unauthorized.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /view_user <user_id>")
+    target = context.args[0]
+    users = context.bot_data['users_info']
+    history = context.bot_data['histories'].get(target, [])
+    if target not in users:
+        return await update.message.reply_text(f"No data for user {target}.")
+    info = users[target]
+    reply = f"User {target} - @{info['username']} ({info['name']})\nChats:\n"
+    for msg in history:
+        role = msg['role']
+        content = msg['content']
+        reply += f"{role}: {content}\n"
+    await update.message.reply_text(reply[:4000], reply_markup=get_admin_menu())
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -162,44 +198,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid in ADMIN_IDS and 'reply_to' in context.user_data:
         target = context.user_data.pop('reply_to')
         await context.bot.send_message(chat_id=int(target), text=f"Admin: {text}")
-        await update.message.reply_text(f"Sent to user {target}.", reply_markup=ADMIN_MAIN_MENU)
+        await update.message.reply_text(f"Sent to user {target}.", reply_markup=get_admin_menu())
         return
 
     # Back button
     if text == 'Back':
-        menu = ADMIN_MAIN_MENU if uid in ADMIN_IDS else USER_MAIN_MENU
+        menu = get_admin_menu() if uid in ADMIN_IDS else get_user_menu()
         await update.message.reply_text('Back to menu.', reply_markup=menu)
         return
 
-    # Admin menu actions
+    # Admin commands in main menu
     if uid in ADMIN_IDS:
         d = context.bot_data
         if text == 'Stats':
             await update.message.reply_text(
                 f"Users: {len(d['histories'])}, Messages: {len(d['logs'])}, Banned: {len(d['banned'])}",
-                reply_markup=ADMIN_MAIN_MENU
+                reply_markup=get_admin_menu()
             ); return
         if text == 'List Users':
-            users = ', '.join(d['histories'].keys()) or 'None'
-            await update.message.reply_text(f"Users: {users}", reply_markup=ADMIN_MAIN_MENU); return
-        if text == 'View Logs':
-            logs = d['logs'][-10:]
-            msg = '\n'.join(f"{e['time']} {e['user']}: {e['text']}" for e in logs) or 'No logs.'
-            await update.message.reply_text(msg, reply_markup=ADMIN_MAIN_MENU); return
-        if text == 'Clear Logs':
-            d['logs'] = []
-            await update.message.reply_text("Logs cleared.", reply_markup=ADMIN_MAIN_MENU); return
-        if text == 'Clear Histories':
-            d['histories'] = {}
-            await update.message.reply_text("Histories cleared.", reply_markup=ADMIN_MAIN_MENU); return
-        if text == 'Refresh Data':
-            site_cache['ts'] = None
-            page_cache['ts'].clear()
-            await update.message.reply_text("Data cache reset.", reply_markup=ADMIN_MAIN_MENU); return
-        if text == 'Site Info':
-            data = await fetch_site_data()
-            info = f"Plan: {data['plan']}\n" + '\n'.join(f"• {f}" for f in data['features'])
-            await update.message.reply_text(info, reply_markup=ADMIN_MAIN_MENU); return
+            lines = []
+            for uid_str, info in context.bot_data['users_info'].items():
+                lines.append(f"{uid_str}: @{info['username']} ({info['name']})")
+            await update.message.reply_text("\n".join(lines) or 'No users.', reply_markup=get_admin_menu()); return
+        if text == 'View User':
+            await update.message.reply_text("Usage: /view_user <user_id>", reply_markup=get_admin_menu()); return
 
     # User menu actions
     if text == 'Plans': return await plans(update, context)
@@ -263,6 +285,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('payment', payment))
     app.add_handler(CommandHandler('policy', policy))
     app.add_handler(CommandHandler('subpolicy', subpolicy))
+    app.add_handler(CommandHandler('view_user', view_user))
     # Callback handler for live replies
     app.add_handler(CallbackQueryHandler(callback_handler))
     # Message handler
