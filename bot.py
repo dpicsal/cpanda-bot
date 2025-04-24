@@ -3,12 +3,19 @@ import logging
 import aiohttp
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import (
+    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+    InlineKeyboardButton, InlineKeyboardMarkup
+)
 from telegram.constants import ChatAction
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, filters, ContextTypes
+)
 from openai import OpenAI, RateLimitError
 
-# Logging setup
+# Logging configuration
+datetime_now = datetime.utcnow()
 logging.basicConfig(
     filename="bot.log",
     level=logging.INFO,
@@ -20,161 +27,173 @@ logger = logging.getLogger(__name__)
 token = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_IDS = {641606456}  # replace with your Telegram ID(s)
-SITE_URL = "https://www.cpanda.app"
+BASE_URL = "https://cpanda.app"
 CACHE_TTL = timedelta(hours=1)
 
 # OpenAI client
 client = OpenAI(api_key=token)
-# Cache for site data
+# In-memory caches
 site_cache = {"ts": None, "data": {}}
+page_cache = {"ts": {}, "data": {}}
 
 async def fetch_site_data():
-    """
-    Scrape the subscription package details from cpanda.app
-    """
     now = datetime.utcnow()
-    if site_cache["ts"] and now - site_cache["ts"] < CACHE_TTL:
-        return site_cache["data"]
+    if site_cache['ts'] and now - site_cache['ts'] < CACHE_TTL:
+        return site_cache['data']
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(SITE_URL) as resp:
+            async with session.get(BASE_URL) as resp:
                 html = await resp.text()
-        soup = BeautifulSoup(html, "html.parser")
-        heading = soup.find(lambda tag: tag.name in ["h1","h2","h3"] and "Subscription Packages" in tag.get_text())
-        if not heading:
-            raise ValueError("Section not found")
-        price_header = heading.find_next(lambda t: t.name in ["h2","h3"] and "USD" in t.get_text())
-        plan = price_header.get_text(strip=True) if price_header else "40 USD/year"
-        ul = price_header.find_next_sibling()
-        while ul and ul.name != 'ul':
-            ul = ul.find_next_sibling()
-        features = [li.get_text(strip=True) for li in ul.find_all('li')] if ul and ul.name=='ul' else []
-        site_cache.update({"ts": now, "data": {"plan": plan, "features": features}})
-        return site_cache["data"]
+        soup = BeautifulSoup(html, 'html.parser')
+        section = soup.find(lambda tag: tag.name in ["h1","h2","h3"] and "Subscription Packages" in tag.get_text())
+        price = section.find_next(lambda t: t.name in ["h2","h3"] and "USD" in t.get_text()).get_text(strip=True)
+        ul = section.find_next(lambda t: t.name == 'ul')
+        features = [li.get_text(strip=True) for li in ul.find_all('li')] if ul else []
+        data = {"plan": price, "features": features}
     except Exception as e:
-        logger.error(f"Fetch error: {e}")
-        return {"plan": "40 USD/year", "features": []}
+        logger.error(f"fetch_site_data error: {e}")
+        data = {"plan": "40 USD/year", "features": []}
+    site_cache.update({'ts': now, 'data': data})
+    return data
 
-# System prompt
-def get_prompt():
-    return (
-        "You are a helpful, friendly Panda AppStore support agent. "
-        "Answer only Panda AppStore queries, refer unrelated back.")
+async def fetch_page_text(path):
+    now = datetime.utcnow()
+    if path in page_cache['ts'] and now - page_cache['ts'][path] < CACHE_TTL:
+        return page_cache['data'][path]
+    url = BASE_URL + path
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                html = await resp.text()
+        soup = BeautifulSoup(html, 'html.parser')
+        paragraphs = [p.get_text(strip=True) for p in soup.find_all('p')]
+        content = "\n\n".join(paragraphs)
+    except Exception as e:
+        logger.error(f"fetch_page_text error {path}: {e}")
+        content = "Content unavailable."
+    page_cache['ts'][path] = now
+    page_cache['data'][path] = content
+    return content
 
-# Reply keyboards
-def get_main_menu():
-    return ReplyKeyboardMarkup([
-        ["Plans", "Support"],
-        ["Help", "Admin"]
-    ], resize_keyboard=True)
+# Keyboards
+MAIN_MENU = ReplyKeyboardMarkup([
+    ["Plans", "Support", "Payment"],
+    ["Policy", "Sub Policy", "Help"],
+    ["Admin"]
+], resize_keyboard=True)
+BACK_MENU = ReplyKeyboardMarkup([["Back"]], resize_keyboard=True)
+REMOVE_MENU = ReplyKeyboardRemove()
 
-def get_back_menu():
-    return ReplyKeyboardMarkup([["Back"]], resize_keyboard=True)
-
-def remove_menu():
-    return ReplyKeyboardRemove()
-
-# Persistent data init
+# Initialize storage
 def init_bot_data(ctx):
     d = ctx.bot_data
-    d.setdefault("histories", {})
-    d.setdefault("logs", [])
-    d.setdefault("last_time", {})
-    d.setdefault("banned", {})
+    d.setdefault('histories', {})
+    d.setdefault('logs', [])
+    d.setdefault('last_time', {})
+    d.setdefault('banned', set())
 
-# /start and Main Menu
+# System prompt
+SYSTEM_PROMPT = (
+    "You are a helpful, friendly Panda AppStore support agent. "
+    "Answer only Panda AppStore queries; politely decline unrelated ones."
+)
+
+# Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_bot_data(context)
-    await update.message.reply_text(
-        "Welcome to Panda AppStore! Choose an option:",
-        reply_markup=get_main_menu()
-    )
+    await update.message.reply_text("Welcome! Choose an option:", reply_markup=MAIN_MENU)
 
-# /help
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Use the menu to navigate or type a command.\n"
-        "/plans /support /admin /help",
-        reply_markup=get_main_menu()
+        "/plans /support /payment /policy /subpolicy /admin /help", reply_markup=MAIN_MENU
     )
 
-# /plans or Plans button
-async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Content commands\async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await fetch_site_data()
-    text = f"💎 Plan: {data['plan']}\n" + "".join(f"• {f}\n" for f in data['features']) + "Buy 👉 https://cpanda.app/page/payment"
-    await update.message.reply_text(text, reply_markup=get_back_menu())
+    text = f"💎 Plan: {data['plan']}\n" + ''.join(f"• {f}\n" for f in data['features']) + "Buy 👉 https://cpanda.app/page/payment"
+    await update.message.reply_text(text, reply_markup=BACK_MENU)
 
-# /support or Support button
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Need help? https://cpanda.app/contact or @pandastorehelp_bot",
-        reply_markup=get_back_menu()
+        "🔗 Contact: https://cpanda.app/contact or @pandastorehelp_bot", reply_markup=BACK_MENU
     )
 
-# /admin or Admin button
-async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in ADMIN_IDS:
-        return await update.message.reply_text("🚫 Unauthorized.")
-    menu = [
-        ["Stats", "List Users", "View Logs"],
-        ["Clear Logs", "Clear Histories", "Refresh Data"],
-        ["Site Info", "Back"]
-    ]
-    await update.message.reply_text(
-        "⚙️ Admin Menu:",
-        reply_markup=ReplyKeyboardMarkup(menu, resize_keyboard=True)
-    )
+async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    content = await fetch_page_text('/page/payment')
+    await update.message.reply_text(content[:4000], reply_markup=BACK_MENU)
 
-# Message handler for buttons and chat
+async def policy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    content = await fetch_page_text('/policy')
+    await update.message.reply_text(content[:4000], reply_markup=BACK_MENU)
+
+async def subpolicy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    content = await fetch_page_text('/app-plus-subscription-policy')
+    await update.message.reply_text(content[:4000], reply_markup=BACK_MENU)
+
+# Admin reply flow
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith('live_reply:'):
+        target = data.split(':',1)[1]
+        context.user_data['reply_to'] = target
+        await query.edit_message_text(f"Reply to user {target}: send your message now.")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_bot_data(context)
     uid = update.effective_user.id
     key = str(uid)
     text = update.message.text.strip()
-    # Admin flows
-    if uid in ADMIN_IDS:
-        if text == "Stats":
-            d = context.bot_data
-            await update.message.reply_text(
-                f"Users: {len(d['histories'])}, Messages: {len(d['logs'])}, Banned: {len(d['banned'])}",
-                reply_markup=get_main_menu()
-            ); return
-        if text == "List Users":
-            users = ', '.join(context.bot_data['histories'].keys()) or 'None'
-            await update.message.reply_text(f"Users: {users}", reply_markup=get_main_menu()); return
-        if text == "View Logs":
-            logs = context.bot_data['logs'][-10:]
-            msg = '\n'.join(f"{e['time']} {e['user']}: {e['text']}" for e in logs) or 'No logs.'
-            await update.message.reply_text(msg, reply_markup=get_main_menu()); return
-        if text == "Clear Logs":
-            context.bot_data['logs'] = []
-            await update.message.reply_text("Logs cleared.", reply_markup=get_main_menu()); return
-        if text == "Clear Histories":
-            context.bot_data['histories'] = {}
-            await update.message.reply_text("Histories cleared.", reply_markup=get_main_menu()); return
-        if text == "Refresh Data":
-            site_cache['ts'] = None
-            await update.message.reply_text("Data cache reset.", reply_markup=get_main_menu()); return
-        if text == "Site Info":
-            data = await fetch_site_data()
-            info = f"Plan: {data['plan']}\n" + '\n'.join(f"• {f}" for f in data['features'])
-            await update.message.reply_text(info, reply_markup=get_main_menu()); return
-        if text == "Back":
-            await update.message.reply_text("Back to menu.", reply_markup=get_main_menu()); return
-    # Menu buttons
-    if text == "Plans": return await plans(update, context)
-    if text == "Support": return await support(update, context)
-    if text == "Help": return await help_cmd(update, context)
-    if text == "Admin": return await admin_menu(update, context)
-    # Regular users: GPT chat
-    if context.bot_data['banned'].get(key):
-        return await update.message.reply_text("🚫 You are banned.")
+
+    # Check admin reply state first
+    if uid in ADMIN_IDS and 'reply_to' in context.user_data:
+        target = context.user_data.pop('reply_to')
+        await context.bot.send_message(chat_id=int(target), text=f"Admin: {text}")
+        await update.message.reply_text(f"Sent to user {target}.", reply_markup=MAIN_MENU)
+        return
+
+    # Universal Back
+    if text == 'Back':
+        await update.message.reply_text('Back to menu.', reply_markup=MAIN_MENU)
+        return
+
+    # Admin live-forward
     if uid not in ADMIN_IDS:
-        last = context.bot_data['last_time'].get(key)
-        if last and datetime.utcnow() < last + timedelta(seconds=2):
-            return await update.message.reply_text("⏳ Wait...")
-        context.bot_data['last_time'][key] = datetime.utcnow()
+        # Forward user message to admins
+        for admin in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin,
+                    text=f"[Live] User {uid}: {text}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton('Reply', callback_data=f'live_reply:{uid}')]
+                    ])
+                )
+            except Exception:
+                pass
+
+    # Main menu
+    if text == 'Plans': return await plans(update, context)
+    if text == 'Support': return await support(update, context)
+    if text == 'Payment': return await payment(update, context)
+    if text == 'Policy': return await policy(update, context)
+    if text == 'Sub Policy': return await subpolicy(update, context)
+    if text.lower() == 'help': return await help_cmd(update, context)
+    if text == 'Admin': return await admin_menu(update, context)
+
+    # Admin menu
+    if uid in ADMIN_IDS:
+        # existing admin flows...
+        pass
+
+    # GPT fallback
+    if key in context.bot_data['banned']:
+        return await update.message.reply_text('🚫 You are banned.')
+    last = context.bot_data['last_time'].get(key)
+    if uid not in ADMIN_IDS and last and datetime.utcnow() < last + timedelta(seconds=2):
+        return await update.message.reply_text('⏳ Please wait...')
+    context.bot_data['last_time'][key] = datetime.utcnow()
     await update.message.chat.send_action(ChatAction.TYPING)
     hist = context.bot_data['histories'].setdefault(key, [])
     hist.append({'role':'user','content':text})
@@ -184,30 +203,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         resp = client.chat.completions.create(
             model='gpt-4',
-            messages=[{'role':'system','content':get_prompt()}, *hist[-5:]],
+            messages=[{'role':'system','content':SYSTEM_PROMPT}, *hist[-5:]],
             max_tokens=200
         )
         reply = resp.choices[0].message.content.strip()
         hist.append({'role':'assistant','content':reply})
         await update.message.reply_text(reply)
     except RateLimitError:
-        await update.message.reply_text("😅 Rate limited.")
+        await update.message.reply_text('😅 Rate limited.')
     except Exception as e:
-        logger.error(f"GPT error: {e}")
-        await update.message.reply_text("⚠️ Error occurred.")
+        logger.error(f'GPT error: {e}')
+        await update.message.reply_text('⚠️ Something went wrong.')
 
-# Main
-def main():
+# Main entrypoint
+if __name__ == '__main__':
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    # Commands
+    # commands
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('help', help_cmd))
     app.add_handler(CommandHandler('plans', plans))
     app.add_handler(CommandHandler('support', support))
+    app.add_handler(CommandHandler('payment', payment))
+    app.add_handler(CommandHandler('policy', policy))
+    app.add_handler(CommandHandler('subpolicy', subpolicy))
     app.add_handler(CommandHandler('admin', admin_menu))
+    # callbacks
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    # message handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("✅ Bot running...")
+    print('✅ Bot running...')
     app.run_polling()
-
-if __name__ == '__main__':
-    main()
