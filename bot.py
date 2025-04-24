@@ -57,7 +57,9 @@ def get_embedding(text: str):
     if not RAG_ENABLED:
         return None
     res = client.embeddings.create(input=[text], model="text-embedding-ada-002")
-    return np.array(res['data'][0]['embedding'], dtype=np.float32)
+    # access embedding from CreateEmbeddingResponse
+    embedding = res.data[0].embedding if hasattr(res, 'data') else res['data'][0]['embedding']
+    return np.array(embedding, dtype=np.float32), dtype=np.float32)
 
 documents = []
 index = None
