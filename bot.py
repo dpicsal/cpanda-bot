@@ -41,21 +41,10 @@ USER_MAIN_MENU = ReplyKeyboardMarkup([
     ["Plans", "Support", "Payment"],
     ["Policy", "Sub Policy", "Help"]
 ], resize_keyboard=True)
-# Admin sees extra controls directly
 ADMIN_MAIN_MENU = ReplyKeyboardMarkup([
     ["Stats", "List Users", "View Logs"],
     ["Plans", "Support", "Payment"],
     ["Policy", "Sub Policy", "Help"]
-], resize_keyboard=True)
-BACK_MENU = ReplyKeyboardMarkup([["Back"]], resize_keyboard=True)
-REMOVE_MENU = ReplyKeyboardRemove()([
-    ["Plans", "Support", "Payment"],
-    ["Policy", "Sub Policy", "Help"]
-], resize_keyboard=True)
-ADMIN_MAIN_MENU = ReplyKeyboardMarkup([
-    ["Plans", "Support", "Payment"],
-    ["Policy", "Sub Policy", "Help"],
-    ["Admin"]
 ], resize_keyboard=True)
 BACK_MENU = ReplyKeyboardMarkup([["Back"]], resize_keyboard=True)
 REMOVE_MENU = ReplyKeyboardRemove()
@@ -76,7 +65,8 @@ async def fetch_site_data():
     data = {"plan": "40 USD/year", "features": []}
     try:
         async with aiohttp.ClientSession() as session:
-            html = await (await session.get(BASE_URL)).text()
+            resp = await session.get(BASE_URL)
+            html = await resp.text()
         soup = BeautifulSoup(html, 'html.parser')
         section = soup.find(lambda tag: tag.name in ["h1","h2","h3"] and "Subscription Packages" in tag.get_text())
         if section:
@@ -97,7 +87,8 @@ async def fetch_page_text(path):
     content = "Content unavailable."
     try:
         async with aiohttp.ClientSession() as session:
-            html = await (await session.get(BASE_URL + path)).text()
+            resp = await session.get(BASE_URL + path)
+            html = await resp.text()
         soup = BeautifulSoup(html, 'html.parser')
         paragraphs = [p.get_text(strip=True) for p in soup.find_all('p')]
         content = "\n\n".join(paragraphs)
@@ -124,8 +115,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     menu = ADMIN_MAIN_MENU if uid in ADMIN_IDS else USER_MAIN_MENU
     await update.message.reply_text(
-        "/plans /support /payment /policy /subpolicy /admin /help",
-        reply_markup=menu
+        "/plans /support /payment /policy /subpolicy /help", reply_markup=menu
     )
 
 async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,8 +128,7 @@ async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔗 Contact: https://cpanda.app/contact or @pandastorehelp_bot",
-        reply_markup=BACK_MENU
+        "🔗 Contact: https://cpanda.app/contact or @pandastorehelp_bot", reply_markup=BACK_MENU
     )
 
 async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -153,17 +142,6 @@ async def policy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def subpolicy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await fetch_page_text('/app-plus-subscription-policy')
     await update.message.reply_text(text[:4000], reply_markup=BACK_MENU)
-
-async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in ADMIN_IDS:
-        return await update.message.reply_text("🚫 Unauthorized.")
-    menu = ReplyKeyboardMarkup([
-        ["Stats", "List Users", "View Logs"],
-        ["Clear Logs", "Clear Histories", "Refresh Data"],
-        ["Site Info", "Back"]
-    ], resize_keyboard=True)
-    await update.message.reply_text("⚙️ Admin Menu:", reply_markup=menu)
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -230,7 +208,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == 'Policy': return await policy(update, context)
     if text == 'Sub Policy': return await subpolicy(update, context)
     if text.lower() == 'help': return await help_cmd(update, context)
-    
 
     # Live forwarding
     if uid not in ADMIN_IDS:
@@ -247,16 +224,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
     # GPT fallback
-    if key in context.bot_data['banned']:
+    d = context.bot_data
+    if key in d['banned']:
         return await update.message.reply_text('🚫 You are banned.')
-    last = context.bot_data['last_time'].get(key)
+    last = d['last_time'].get(key)
     if uid not in ADMIN_IDS and last and datetime.utcnow() < last + timedelta(seconds=2):
         return await update.message.reply_text('⏳ Please wait...')
-    context.bot_data['last_time'][key] = datetime.utcnow()
+    d['last_time'][key] = datetime.utcnow()
     await update.message.chat.send_action(ChatAction.TYPING)
-    hist = context.bot_data['histories'].setdefault(key, [])
+    hist = d['histories'].setdefault(key, [])
     hist.append({'role':'user','content':text})
-    d = context.bot_data
     d['logs'].append({'time':datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),'user':key,'text':text})
     d['logs'] = d['logs'][-1000:]
     d['histories'][key] = hist[-100:]
