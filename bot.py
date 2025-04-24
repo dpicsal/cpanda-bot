@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 # ## API Keys and Admin IDs (loaded from environment)
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_IDS = [641606456]  # Replace with your actual Telegram user ID (use @getidsbot to find it)
+ADMIN_IDS = os.getenv[641606456]  # Replace with your actual Telegram user ID (use @getidsbot to find it)
 
 # OpenAI client setup
 client = OpenAI(api_key=OPENAI_API_KEY)
