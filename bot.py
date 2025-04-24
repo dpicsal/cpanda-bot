@@ -227,16 +227,23 @@ async def fetch_page_text(path):
     now = datetime.utcnow()
     if path in page_cache['ts'] and now - page_cache['ts'][path] < CACHE_TTL:
         return page_cache['data'][path]
-    content = "
+    try:
+        async with aiohttp.ClientSession() as session:
+            resp = await session.get(BASE_URL + path)
+            html = await resp.text()
+        soup = BeautifulSoup(html, 'html.parser')
+        paragraphs = [p.get_text(strip=True) for p in soup.find_all('p')]
+        content = "
 
 ".join(paragraphs)
     except Exception as e:
         logger.error(f"fetch_page_text error {path}: {e}")
+        content = "Content unavailable."
     page_cache['ts'][path] = now
     page_cache['data'][path] = content
     return content
 
-async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):(update: Update, context: ContextTypes.DEFAULT_TYPE):(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = site_cache['data'] if site_cache['data'] else await fetch_site_data()
     plan_line = f"💎 Plan: {data['plan']}\n"
     features_text = "".join(f"• {f}\n" for f in data['features'])
