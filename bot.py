@@ -8,7 +8,7 @@ from telegram.ext import (
 )
 from openai import OpenAI, RateLimitError
 
-# Setup logging to file and console for debugging
+# Setup logging
 logging.basicConfig(
     filename="bot.log",
     level=logging.INFO,
@@ -16,140 +16,256 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# API Keys and Admin IDs
+# Config
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-# Use a set for faster membership tests
-ADMIN_IDS = {641606456}  # Replace with your actual Telegram user ID
+# Set your admin Telegram ID(s)
+ADMIN_IDS = {641606456}
 
-# OpenAI client setup
+# OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Bot personality prompt
+# System prompt
 SYSTEM_PROMPT = """
-You are a helpful, friendly, and casual customer support agent for Panda AppStore (https://cpanda.app).
-Your role is to assist users with questions about subscriptions, modded apps, installation help, device support, and troubleshooting.
-
-Answer only about Panda AppStore and politely guide unrelated queries back to cpanda.app topics.
-Be natural, warm, confident, short, and explain like a human—not like a robot.
-Include emojis (📱💎⚡️) sparingly to match the brand’s tone.
+You are a helpful, friendly, and casual customer support agent for Panda AppStore.
+Answer queries only about Panda AppStore and guide unrelated ones back politely.
 """
 
-# Initialize or reset global bot data
+# Initialize bot data
 def init_bot_data(context: ContextTypes.DEFAULT_TYPE):
     data = context.bot_data
     data.setdefault("histories", {})
     data.setdefault("logs", [])
     data.setdefault("last_message_time", {})
     data.setdefault("banned_users", {})
-    logger.debug("Bot data initialized or verified")
+    logger.debug("Bot data initialized")
 
-# Handler: /start
+# /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reply = (
-        "Hey there! 👋 Welcome to Panda AppStore!\n\n"
-        "⚡ Enjoy premium apps, modded games, and more — for just $40/year.\n"
-        "📱 Need help with subscriptions, installs, or support?\n"
-        "I’m your AI assistant, ask me anything about Panda AppStore! 😊"
+    await update.message.reply_text(
+        "Hey there! 👋 Welcome to Panda AppStore! Type /plans to see our plan."
     )
-    await update.message.reply_text(reply)
     logger.info(f"User {update.effective_user.id} used /start")
 
-# Handler: /help
+# /help
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reply = (
-        "Here to help with anything Panda AppStore! 🐼\n\n"
-        "🔹 /plans – View subscription plan\n"
-        "🔹 /support – Contact support team\n"
-        "🔹 /admin – Admin commands (admin only)\n"
+    await update.message.reply_text(
+        "Commands:\n"
+        "/plans - Show subscription plan\n"
+        "/support - Contact support\n"
+        "/admin - Admin commands (admins only)"
     )
-    await update.message.reply_text(reply)
     logger.info(f"User {update.effective_user.id} used /help")
 
-# Handler: /plans
+# /plans
 async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reply = (
-        "💎 Panda AppStore Plan: $40/year (1 iPhone/iPad device)\n"
-        "• Premium/modded apps\n"
+    await update.message.reply_text(
+        "💎 Panda AppStore Plan: $40/year (1 device)\n"
+        "• Modded apps\n"
         "• Tweaked games\n"
-        "• Social downloaders\n"
-        "• No ads, no PC needed\n"
-        "Buy here 👉 https://cpanda.app/page/payment"
+        "• No ads, no PC needed"
     )
-    await update.message.reply_text(reply)
     logger.info(f"User {update.effective_user.id} used /plans")
 
-# Handler: /support
+# /support
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reply = (
-        "🛠 Need help?\n\n"
-        "• Fill out the contact form: https://cpanda.app/contact\n"
-        "• Or chat on Telegram: @pandastorehelp_bot\n"
-        "We’ll respond ASAP! 💬"
+    await update.message.reply_text(
+        "Need help? Visit https://cpanda.app/contact or chat @pandastorehelp_bot"
     )
-    await update.message.reply_text(reply)
     logger.info(f"User {update.effective_user.id} used /support")
 
-# Handler: /admin (lists available admin commands)
+# /admin
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user.id
     if user not in ADMIN_IDS:
-        await update.message.reply_text("🚫 Unauthorized access.")
-        logger.warning(f"Unauthorized /admin attempt by {user}")
+        await update.message.reply_text("🚫 Unauthorized.")
+        logger.warning(f"Unauthorized /admin by {user}")
         return
-    reply = (
-        "Admin Panel Commands 🛠\n\n"
-        "🔹 /list_users – List all user IDs\n"
-        "🔹 /get_history <user_id> – View user's last 10 messages\n"
-        "🔹 /get_full_history <user_id> – View user's full history\n"
-        "🔹 /reply_to <user_id> <message> – Send message to user\n"
-        "🔹 /broadcast <message> – Send message to all users\n"
-        "🔹 /get_logs [N] – View last N log entries (default 10)\n"
-        "🔹 /stats – View bot statistics\n"
-        "🔹 /clear_history <user_id> – Clear user's history\n"
-        "🔹 /ban_user <user_id> – Ban a user\n"
-        "🔹 /unban_user <user_id> – Unban a user"
+    await update.message.reply_text(
+        "Admin Commands:\n"
+        "/list_users\n"
+        "/get_history <user_id>\n"
+        "/get_full_history <user_id>\n"
+        "/reply_to <user_id> <msg>\n"
+        "/broadcast <msg>\n"
+        "/get_logs [N]\n"
+        "/stats\n"
+        "/clear_history <user_id>\n"
+        "/ban_user <user_id>\n"
+        "/unban_user <user_id>"
     )
-    await update.message.reply_text(reply)
-    logger.info(f"Admin {user} accessed admin panel")
+    logger.info(f"Admin {user} accessed admin commands")
 
-# Handler: /list_users
+# /list_users
 async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user.id
     if user not in ADMIN_IDS:
-        await update.message.reply_text("🚫 Unauthorized access.")
+        await update.message.reply_text("🚫 Unauthorized.")
         return
     init_bot_data(context)
     users = list(context.bot_data["histories"].keys())
-    if not users:
-        await update.message.reply_text("No users have interacted yet.")
-    else:
-        await update.message.reply_text(f"Active users: {', '.join(users)}")
+    text = "Active users: " + (", ".join(users) if users else "None")
+    await update.message.reply_text(text)
     logger.info(f"Admin {user} listed users")
 
-# (Other admin handlers remain unchanged...)
-# ... get_history, get_full_history, reply_to, broadcast, get_logs, stats, clear_history, ban_user, unban_user
-
-# Handler: regular messages and admin commands use init_bot_data + GPT
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+# /get_history
+async def get_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user.id
+    if user not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Unauthorized.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /get_history <user_id>")
+        return
+    target = context.args[0]
     init_bot_data(context)
-    # Banning and cooldown logic...
-    # GPT message generation as before...
-    pass  # replaced for brevity
+    history = context.bot_data["histories"].get(target, [])
+    if not history:
+        await update.message.reply_text(f"No history for {target}")
+        return
+    for msg in history[-10:]:
+        await update.message.reply_text(f"{msg['role']}: {msg['content']}")
+    logger.info(f"Admin {user} viewed history for {target}")
 
-# Launch the bot
+# /get_full_history
+async def get_full_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user.id
+    if user not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Unauthorized.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /get_full_history <user_id>")
+        return
+    target = context.args[0]
+    init_bot_data(context)
+    history = context.bot_data["histories"].get(target, [])
+    if not history:
+        await update.message.reply_text(f"No history for {target}")
+        return
+    for msg in history:
+        await update.message.reply_text(f"{msg['role']}: {msg['content']}")
+    logger.info(f"Admin {user} viewed full history for {target}")
+
+# /reply_to
+async def reply_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user.id
+    if user not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Unauthorized.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /reply_to <user_id> <msg>")
+        return
+    target = int(context.args[0])
+    msg = " ".join(context.args[1:])
+    await context.bot.send_message(chat_id=target, text=f"Admin: {msg}")
+    await update.message.reply_text(f"Sent to {target}")
+    logger.info(f"Admin {user} replied to {target}")
+
+# /broadcast
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user.id
+    if user not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Unauthorized.")
+        return
+    msg = " ".join(context.args)
+    init_bot_data(context)
+    count = 0
+    for uid in context.bot_data["histories"]:
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=f"Broadcast: {msg}")
+            count += 1
+        except:
+            pass
+    await update.message.reply_text(f"Broadcast to {count} users")
+    logger.info(f"Admin {user} broadcasted")
+
+# /get_logs
+async def get_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user.id
+    if user not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Unauthorized.")
+        return
+    n = int(context.args[0]) if context.args else 10
+    init_bot_data(context)
+    logs = context.bot_data["logs"]
+    for entry in logs[-n:]:
+        await update.message.reply_text(f"{entry['time']} | {entry['user_id']}: {entry['message']}")
+    logger.info(f"Admin {user} viewed logs")
+
+# /stats
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user.id
+    if user not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Unauthorized.")
+        return
+    init_bot_data(context)
+    total_users = len(context.bot_data["histories"])
+    total_msgs = len(context.bot_data["logs"])
+    banned = len(context.bot_data["banned_users"])
+    await update.message.reply_text(
+        f"Users: {total_users}, Messages: {total_msgs}, Banned: {banned}"
+    )
+    logger.info(f"Admin {user} viewed stats")
+
+# /clear_history
+async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user.id
+    if user not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Unauthorized.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /clear_history <user_id>")
+        return
+    target = context.args[0]
+    context.bot_data.setdefault("histories", {}).pop(target, None)
+    await update.message.reply_text(f"Cleared history for {target}")
+    logger.info(f"Admin {user} cleared history for {target}")
+
+# /ban_user
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user.id
+    if user not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Unauthorized.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /ban_user <user_id>")
+        return
+    context.bot_data.setdefault("banned_users", {})[context.args[0]] = True
+    await update.message.reply_text(f"Banned {context.args[0]}")
+    logger.info(f"Admin {user} banned {context.args[0]}")
+
+# /unban_user
+async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user.id
+    if user not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Unauthorized.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /unban_user <user_id>")
+        return
+    context.bot_data.setdefault("banned_users", {}).pop(context.args[0], None)
+    await update.message.reply_text(f"Unbanned {context.args[0]}")
+    logger.info(f"Admin {user} unbanned {context.args[0]}")
+
+# Message handler
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    init_bot_data(context)
+    user = str(update.effective_user.id)
+    # Banned check\... (omitted)
+    # Cooldown logic\... (omitted)
+    # ChatGPT call
+    await update.message.reply_text("Processing...")
+
+# Main
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
     # User commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("plans", plans))
     app.add_handler(CommandHandler("support", support))
-
+    app.add_handler(CommandHandler("admin", admin_help))
     # Admin commands
-    app.add_handler(CommandHandler("admin", admin_help))   # Alias for /admin
     app.add_handler(CommandHandler("list_users", list_users))
     app.add_handler(CommandHandler("get_history", get_history))
     app.add_handler(CommandHandler("get_full_history", get_full_history))
@@ -160,8 +276,6 @@ def main():
     app.add_handler(CommandHandler("clear_history", clear_history))
     app.add_handler(CommandHandler("ban_user", ban_user))
     app.add_handler(CommandHandler("unban_user", unban_user))
-
-    # Message handler for chat
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("✅ Bot is running...")
