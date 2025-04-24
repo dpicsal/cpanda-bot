@@ -1,4 +1,6 @@
-python-telegram-bot==22.0
-openai==1.75.0
+python-telegram-bot>=20.0
+openai
 aiohttp
 beautifulsoup4
+numpy
+faiss-cpu
