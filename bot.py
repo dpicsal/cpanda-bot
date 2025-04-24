@@ -110,3 +110,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Content commands
 async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show subscription plan scraped from site"""
+    data = await fetch_site_data()
+    text = f"💎 Plan: {data['plan']}
+"
+    for f in data['features']:
+        text += f"• {f}
+"
+    text += "Buy 👉 https://cpanda.app/page/payment"
+    await update.message.reply_text(text, reply_markup=BACK_MENU)
