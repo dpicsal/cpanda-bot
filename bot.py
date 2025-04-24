@@ -49,7 +49,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 def get_system_prompt():
     return (
         'You are a helpful, friendly Panda AppStore support agent. '
-        'Answer only about Panda AppStore using provided context or your knowledge.'
+        'Answer only about Panda AppStore using provided context or your memory.'
     )
 
 # ----------------------- RAG Utilities -----------------------
@@ -63,7 +63,6 @@ documents = []
 index = None
 
 async def scrape_and_build_index():
-    """Scrape configured pages and build FAISS index."""
     global documents, index
     if not RAG_ENABLED:
         logger.warning("RAG disabled: numpy/faiss not installed.")
@@ -90,8 +89,7 @@ async def scrape_and_build_index():
                     if txt:
                         parts.append(txt)
             if parts:
-                doc = {'text':'\n'.join(parts), 'path':path, 'heading':heading}
-                documents.append(doc)
+                documents.append({'text':'\n'.join(parts), 'path':path, 'heading':heading})
     if documents:
         embs = np.vstack([get_embedding(d['text']) for d in documents])
         index = faiss.IndexFlatL2(EMBED_DIM)
@@ -126,7 +124,6 @@ REMOVE_MENU = ReplyKeyboardRemove()
 
 # ----------------------- Scraping Quick Pages -----------------------
 async def fetch_page_text(path):
-    """Fetch and cache paragraph text from a subpage"""
     now = datetime.utcnow()
     cache = getattr(fetch_page_text, 'cache', {})
     ts, content = cache.get(path, (None, None))
@@ -150,12 +147,25 @@ async def fetch_page_text(path):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_bot_data(context)
     uid = update.effective_user.id
+    # Store persistent user info
     context.bot_data['users_info'][str(uid)] = {
         'username': update.effective_user.username,
         'name': update.effective_user.full_name
     }
+    # Initialize or ask for metadata
+    # Here we capture device and timezone for memory
+    # In a real setup, you might prompt user to specify these
+    user_meta = {
+        'device': 'iPhone',       # replace or detect dynamically
+        'timezone': 'UTC+0'        # replace or detect dynamically
+    }
+    context.user_data['meta'] = user_meta
+
     menu = get_admin_menu() if uid in ADMIN_IDS else get_user_menu()
-    await update.message.reply_text('Welcome to Panda AppStore! How can I assist you?', reply_markup=menu)
+    await update.message.reply_text(
+        'Welcome to Panda AppStore! How can I assist you today?',
+        reply_markup=menu
+    )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_bot_data(context)
@@ -163,23 +173,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = str(uid)
     text = update.message.text.strip()
 
-    # Back navigation
+    # Handle Back
     if text == 'Back':
         menu = get_admin_menu() if uid in ADMIN_IDS else get_user_menu()
         await update.message.reply_text('Back to menu.', reply_markup=menu)
         return
 
-    # Admin: view user selection
+    # Admin View User
     if uid in ADMIN_IDS and text == 'View User':
         users = context.bot_data['users_info']
         if not users:
             await update.message.reply_text('No users found.', reply_markup=get_admin_menu())
             return
         buttons = [[InlineKeyboardButton(f"{u}: @{info['username']}", callback_data=f"view_user:{u}")] for u, info in users.items()]
-        await update.message.reply_text('Select user to view:', reply_markup=InlineKeyboardMarkup(buttons))
+        await update.message.reply_text('Select a user:', reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-    # Quick commands
+    # Quick menu commands
     if text == 'Plans':
         content = await fetch_page_text('/')
         await update.message.reply_text(content[:4000], reply_markup=BACK_MENU)
@@ -200,48 +210,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(content[:4000], reply_markup=BACK_MENU)
         return
 
-    # Append to history
-    history = context.bot_data['histories'].setdefault(key, [])
-    history.append({'role':'user','content':text})
-    # Log
-    context.bot_data['logs'].append({'time':datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),'user':key,'text':text})
+    # Record user message in history and logs
+    hist = context.bot_data['histories'].setdefault(key, [])
+    hist.append({'role':'user','content':text})
+    context.bot_data['logs'].append({'time':datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), 'user':key, 'text':text})
 
-    # RAG-based retrieval
+    # Prepare messages for LLM
+    system_msgs = []
+    # Inject memory meta
+    if 'meta' in context.user_data:
+        system_msgs.append({'role':'system', 'content':f"User meta: {context.user_data['meta']}"})
+
+    # RAG context
     if RAG_ENABLED and index is not None:
         q_emb = get_embedding(text)
         _, ids = index.search(np.array([q_emb]), TOP_K)
-        ctx_sections = []
         for i in ids[0]:
             doc = documents[i]
-            ctx_sections.append(f"[{doc['path']} - {doc['heading']}]: {doc['text']}")
-        ctx_text = '\n\n'.join(ctx_sections)
-        prompt_msgs = [
-            {'role':'system','content':get_system_prompt()},
-            {'role':'system','content':ctx_text},
-            {'role':'user','content':text}
-        ]
-    else:
-        # Simple chat fallback
-        prompt_msgs = [
-            {'role':'system','content':get_system_prompt()},
-            *history[-5:],
-            {'role':'user','content':text}
-        ]
+            system_msgs.append({'role':'system', 'content':f"[{doc['path']} - {doc['heading']}]: {doc['text']}"})
 
-    # Chat completion
+    # Conversation context
+    user_msgs = [{'role':'user','content':text}]
+    # Use last 5 turns as needed
+    recent = hist[-5:]
+
+    messages = [{'role':'system','content':get_system_prompt()}] + system_msgs + recent + user_msgs
+
+    # Call ChatGPT
     try:
         await update.message.chat.send_action(ChatAction.TYPING)
-        resp = client.chat.completions.create(model='gpt-4', messages=prompt_msgs, max_tokens=200)
+        resp = client.chat.completions.create(model='gpt-4', messages=messages, max_tokens=200)
         reply = resp.choices[0].message.content.strip()
     except RateLimitError:
-        reply = '😅 Rate limited. Please try again shortly.'
+        reply = '😅 Rate limited—please try again soon.'
     except Exception as e:
         logger.error(f"Chat error: {e}")
-        reply = '⚠️ Something went wrong. Please try again later.'
+        reply = '⚠️ Something went wrong—please try again later.'
 
-    # Store assistant response
-    history.append({'role':'assistant','content':reply})
-    # Reply
+    # Save assistant reply
+    hist.append({'role':'assistant','content':reply})
+
+    # Send reply
     await update.message.reply_text(reply)
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -265,5 +274,5 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print('✅ Bot running...')
+    print('✅ Bot running with memory and RAG...')
     app.run_polling()
