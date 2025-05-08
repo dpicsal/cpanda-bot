@@ -117,23 +117,28 @@ def init_bot_data(ctx):
     d.setdefault('last_time', {})
     d.setdefault('banned', set())
     d.setdefault('users_info', {})
+    d.setdefault('rag_enabled', RAG_ENABLED)  # Track RAG state
 
-# ----------------------- Keyboards -----------------------
-def get_user_menu():
-    return ReplyKeyboardMarkup([
-        ['Plans', 'Support', 'Payment'],
-        ['Policy', 'Sub Policy', 'Help']
-    ], resize_keyboard=True)
-
-def get_admin_menu():
-    return ReplyKeyboardMarkup([
-        ['Stats', 'List Users', 'View User'],
-        ['Plans', 'Support', 'Payment'],
-        ['Policy', 'Sub Policy', 'Help']
-    ], resize_keyboard=True)
-
-BACK_MENU = ReplyKeyboardMarkup([['Back']], resize_keyboard=True)
-REMOVE_MENU = ReplyKeyboardRemove()
+# ----------------------- Admin Panel -----------------------
+def get_admin_panel():
+    keyboard = [
+        [
+            InlineKeyboardButton("View Users", callback_data="admin_view_users"),
+            InlineKeyboardButton("View Logs", callback_data="admin_view_logs"),
+        ],
+        [
+            InlineKeyboardButton("Ban User", callback_data="admin_ban_user"),
+            InlineKeyboardButton("Unban User", callback_data="admin_unban_user"),
+        ],
+        [
+            InlineKeyboardButton("Refresh Cache", callback_data="admin_refresh_cache"),
+            InlineKeyboardButton("Broadcast Message", callback_data="admin_broadcast"),
+        ],
+        [
+            InlineKeyboardButton(f"RAG: {'On' if RAG_ENABLED else 'Off'}", callback_data="admin_toggle_rag"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 # ----------------------- Scraping Utilities -----------------------
 async def fetch_page_text(path):
@@ -221,11 +226,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     context.user_data['meta'] = user_meta
 
-    menu = get_admin_menu() if uid in ADMIN_IDS else get_user_menu()
-    await update.message.reply_text(
-        'Welcome to Panda AppStore! How can I assist you today?',
-        reply_markup=menu
-    )
+    if uid in ADMIN_IDS:
+        await update.message.reply_text(
+            'Welcome to the Panda AppStore Admin Panel!',
+            reply_markup=get_admin_panel()
+        )
+    else:
+        await update.message.reply_text(
+            'Welcome to Panda AppStore! How can I assist you today?',
+            reply_markup=ReplyKeyboardRemove()  # Remove any existing menu
+        )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_bot_data(context)
@@ -233,37 +243,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = str(uid)
     text = update.message.text.strip().lower()
 
-    # Handle Back
-    if text == 'back':
-        menu = get_admin_menu() if uid in ADMIN_IDS else get_user_menu()
-        await update.message.reply_text('Back to menu.', reply_markup=menu)
+    # Check if user is banned
+    if uid in context.bot_data['banned']:
+        await update.message.reply_text("You are banned from using this bot.")
         return
 
-    # Admin View User
-    if uid in ADMIN_IDS and text == 'view user':
-        users = context.bot_data['users_info']
-        if not users:
-            await update.message.reply_text('No users found.', reply_markup=get_admin_menu())
+    # Handle admin commands via text (if needed)
+    if uid in ADMIN_IDS:
+        if text == 'panel':
+            await update.message.reply_text(
+                'Admin Panel:',
+                reply_markup=get_admin_panel()
+            )
             return
-        buttons = [[InlineKeyboardButton(f"{u}: @{info['username']}", callback_data=f"view_user:{u}")] for u, info in users.items()]
-        await update.message.reply_text('Select a user:', reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    # Quick menu commands
-    quick_commands = {
-        'plans': '/',
-        'support': '/contact',
-        'payment': '/page/payment',
-        'policy': '/policy',
-        'sub policy': '/app-plus-subscription-policy'
-    }
-    if text in quick_commands:
-        if text == 'support':
-            await update.message.reply_text('Contact: https://cpanda.app/contact', reply_markup=BACK_MENU)
-        else:
-            content = await fetch_page_text(quick_commands[text])
-            await send_long_message(update, content[:4000], reply_markup=BACK_MENU)
-        return
+        # Allow admins to use the bot as a regular user for queries
+        # Fall through to regular user logic
 
     # Check for app availability query
     app_query = None
@@ -275,16 +269,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         app_query = text
 
     if app_query:
-        app_list = await scrape_app_list('/page/ios-subscriptions', force_refresh=True)  # Force refresh for testing
-        # First try an exact match (case-insensitive)
+        app_list = await scrape_app_list('/page/ios-subscriptions', force_refresh=True)
         matching_apps = [app for app in app_list if app_query.lower() == app['name'].lower()]
         if not matching_apps:
-            # If no exact match, use fuzzy matching with a higher threshold
             matching_apps = [
                 app for app in app_list
                 if difflib.SequenceMatcher(None, app_query.lower(), app['name'].lower()).ratio() > 0.95
             ]
-            # Log the matching process for debugging
             match_scores = [
                 (app['name'], difflib.SequenceMatcher(None, app_query.lower(), app['name'].lower()).ratio())
                 for app in app_list
@@ -298,7 +289,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response += "\n\nℹ️ Note: The Apps Plus subscription system is currently suspended. Check https://cpanda.app/page/ios-subscriptions for updates."
         else:
             response = f"❌ Sorry, **{app_query}** is not listed on https://cpanda.app/page/ios-subscriptions. Try another app or contact support at https://cpanda.app/contact."
-        await update.message.reply_text(response, reply_markup=BACK_MENU)
+        await update.message.reply_text(response)
         hist = context.bot_data['histories'].setdefault(key, [])
         hist.append({'role': 'user', 'content': text})
         hist.append({'role': 'assistant', 'content': response})
@@ -315,7 +306,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'meta' in context.user_data:
         system_msgs.append({'role': 'system', 'content': f"User meta: {context.user_data['meta']}"})
 
-    if RAG_ENABLED and index is not None:
+    if context.bot_data.get('rag_enabled', RAG_ENABLED) and index is not None:
         q_emb = get_embedding(text)
         _, ids = index.search(np.array([q_emb]), TOP_K)
         for i in ids[0]:
@@ -339,22 +330,116 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hist.append({'role': 'assistant', 'content': reply})
     await update.message.reply_text(reply)
 
-async def send_long_message(update, text, reply_markup=None):
-    parts = [text[i:i+4096] for i in range(0, len(text), 4096)]
-    for i, part in enumerate(parts):
-        await update.message.reply_text(part, reply_markup=reply_markup if i == len(parts)-1 else None)
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    uid = query.from_user.id
+    if uid not in ADMIN_IDS:
+        await query.message.reply_text("You are not authorized to use the admin panel.")
+        return
+
     data = query.data
-    if data.startswith('view_user:'):
+    if data == "admin_view_users":
+        users = context.bot_data['users_info']
+        if not users:
+            await query.message.reply_text("No users found.", reply_markup=get_admin_panel())
+            return
+        buttons = [[InlineKeyboardButton(f"{u}: @{info['username']}", callback_data=f"view_user:{u}")] for u, info in users.items()]
+        await query.message.reply_text("Select a user:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back")]]))
+        return
+
+    if data == "admin_view_logs":
+        logs = context.bot_data['logs'][-10:]  # Last 10 log entries
+        if not logs:
+            await query.message.reply_text("No logs available.", reply_markup=get_admin_panel())
+            return
+        log_text = "\n".join([f"{log['time']} - User {log['user']}: {log['text']}" for log in logs])
+        await query.message.reply_text(f"Recent Logs:\n{log_text}", reply_markup=get_admin_panel())
+        return
+
+    if data == "admin_ban_user":
+        users = context.bot_data['users_info']
+        if not users:
+            await query.message.reply_text("No users to ban.", reply_markup=get_admin_panel())
+            return
+        buttons = [[InlineKeyboardButton(f"{u}: @{info['username']}", callback_data=f"ban_user:{u}")] for u, info in users.items()]
+        await query.message.reply_text("Select a user to ban:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back")]]))
+        return
+
+    if data == "admin_unban_user":
+        banned = context.bot_data['banned']
+        if not banned:
+            await query.message.reply_text("No banned users.", reply_markup=get_admin_panel())
+            return
+        buttons = [[InlineKeyboardButton(f"{u}", callback_data=f"unban_user:{u}")] for u in banned]
+        await query.message.reply_text("Select a user to unban:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back")]]))
+        return
+
+    if data == "admin_refresh_cache":
+        # Clear caches
+        if hasattr(fetch_page_text, 'cache'):
+            fetch_page_text.cache = {}
+        if hasattr(scrape_app_list, 'cache'):
+            scrape_app_list.cache = {}
+        await query.message.reply_text("Caches refreshed.", reply_markup=get_admin_panel())
+        return
+
+    if data == "admin_broadcast":
+        context.user_data['awaiting_broadcast'] = True
+        await query.message.reply_text("Please enter the message to broadcast:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin_back")]]))
+        return
+
+    if data == "admin_toggle_rag":
+        if np is None or faiss is None:
+            await query.message.reply_text("RAG cannot be enabled: numpy/faiss not installed.", reply_markup=get_admin_panel())
+            return
+        context.bot_data['rag_enabled'] = not context.bot_data.get('rag_enabled', RAG_ENABLED)
+        await query.message.reply_text(f"RAG is now {'enabled' if context.bot_data['rag_enabled'] else 'disabled'}.", reply_markup=get_admin_panel())
+        return
+
+    if data.startswith("view_user:"):
         target = data.split(':', 1)[1]
         info = context.bot_data['users_info'].get(target, {})
         hist = context.bot_data['histories'].get(target, [])
         lines = [f"User {target}: @{info.get('username')} ({info.get('name')})"]
         lines += [f"{m['role']}: {m['content']}" for m in hist[-10:]]
-        await query.edit_message_text('\n'.join(lines))
+        await query.message.reply_text('\n'.join(lines), reply_markup=get_admin_panel())
+        return
+
+    if data.startswith("ban_user:"):
+        target = int(data.split(':', 1)[1])
+        context.bot_data['banned'].add(target)
+        await query.message.reply_text(f"User {target} has been banned.", reply_markup=get_admin_panel())
+        return
+
+    if data.startswith("unban_user:"):
+        target = int(data.split(':', 1)[1])
+        context.bot_data['banned'].discard(target)
+        await query.message.reply_text(f"User {target} has been unbanned.", reply_markup=get_admin_panel())
+        return
+
+    if data == "admin_back":
+        await query.message.reply_text("Admin Panel:", reply_markup=get_admin_panel())
+        return
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    # Handle admin panel callbacks
+    if data.startswith("admin_") or data.startswith("view_user:") or data.startswith("ban_user:") or data.startswith("unban_user:"):
+        await admin_callback_handler(update, context)
+        return
+
+    # Handle broadcast message cancellation
+    if data == "admin_back" and context.user_data.get('awaiting_broadcast'):
+        context.user_data.pop('awaiting_broadcast', None)
+        await query.message.reply_text("Broadcast cancelled.", reply_markup=get_admin_panel())
+        return
+
+    # Default callback handling (if any)
+    await query.message.reply_text("Unknown action.", reply_markup=get_admin_panel() if query.from_user.id in ADMIN_IDS else None)
 
 # ----------------------- Main Entrypoint -----------------------
 if __name__ == '__main__':
