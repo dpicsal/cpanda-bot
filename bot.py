@@ -13,6 +13,7 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes
 )
 from openai import OpenAI, RateLimitError
+import difflib  # Added for fuzzy matching
 
 # Optional RAG dependencies
 try:
@@ -30,7 +31,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_IDS = {641606456}  # Telegram IDs of admins
 BASE_URL = "https://cpanda.app"
 SCRAPE_PATHS = ["/", "/page/payment", "/policy", "/app-plus-subscription-policy"]
-CACHE_TTL = timedelta(hours=1)
+CACHE_TTL = timedelta(minutes=5)  # Reduced for testing
 EMBED_DIM = 1536
 TOP_K = 3
 
@@ -70,7 +71,6 @@ async def scrape_and_build_index():
         return
     documents.clear()
     
-    # Scrape predefined paths
     for path in SCRAPE_PATHS:
         url = BASE_URL.rstrip('/') + path
         try:
@@ -94,7 +94,6 @@ async def scrape_and_build_index():
             if parts:
                 documents.append({'text': '\n'.join(parts), 'path': path, 'heading': heading})
     
-    # Add apps from /page/ios-subscriptions
     app_list = await scrape_app_list('/page/ios-subscriptions')
     for app in app_list:
         documents.append({
@@ -138,7 +137,7 @@ REMOVE_MENU = ReplyKeyboardRemove()
 
 # ----------------------- Scraping Utilities -----------------------
 async def fetch_page_text(path):
-    now = datetime.now(timezone.utc)  # Fixed: Use timezone.utc
+    now = datetime.now(timezone.utc)
     cache = getattr(fetch_page_text, 'cache', {})
     ts, content = cache.get(path, (None, None))
     if ts and now - ts < CACHE_TTL:
@@ -146,6 +145,7 @@ async def fetch_page_text(path):
     try:
         async with aiohttp.ClientSession() as session:
             resp = await session.get(BASE_URL + path)
+            resp.raise_for_status()  # Ensure request succeeds
             html = await resp.text()
         soup = BeautifulSoup(html, 'html.parser')
         paras = [p.get_text(strip=True) for p in soup.find_all('p')]
@@ -162,16 +162,18 @@ async def scrape_app_list(path):
     Scrapes the iOS subscriptions page for a list of available apps and their features.
     Returns a list of dictionaries with app names, features, and metadata.
     """
-    now = datetime.now(timezone.utc)  # Fixed: Use timezone.utc
+    now = datetime.now(timezone.utc)
     cache = getattr(scrape_app_list, 'cache', {})
     ts, app_list = cache.get(path, (None, None))
     if ts and now - ts < CACHE_TTL:
+        logger.info(f"Using cached app list for {path}")
         return app_list
 
     app_list = []
     try:
         async with aiohttp.ClientSession() as session:
             resp = await session.get(BASE_URL + path)
+            resp.raise_for_status()  # Ensure request succeeds
             html = await resp.text()
         soup = BeautifulSoup(html, 'html.parser')
         
@@ -194,6 +196,7 @@ async def scrape_app_list(path):
                     'path': path,
                     'heading': app_name
                 })
+        logger.info(f"Scraped apps from {path}: {[app['name'] for app in app_list]}")
     except Exception as e:
         logger.error(f"scrape_app_list error {path}: {e}")
         app_list = []
@@ -271,7 +274,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if app_query:
         app_list = await scrape_app_list('/page/ios-subscriptions')
-        matching_apps = [app for app in app_list if app_query.lower() in app['name'].lower()]
+        # Use fuzzy matching to find a close match (90% similarity)
+        matching_apps = [
+            app for app in app_list
+            if difflib.SequenceMatcher(None, app_query.lower(), app['name'].lower()).ratio() > 0.9
+        ]
         if matching_apps:
             app = matching_apps[0]
             response = f"✅ **{app['name']}** is available on Panda AppStore!\n\nFeatures:\n- " + "\n- ".join(app['features'][:5])
@@ -282,13 +289,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hist = context.bot_data['histories'].setdefault(key, [])
         hist.append({'role': 'user', 'content': text})
         hist.append({'role': 'assistant', 'content': response})
-        context.bot_data['logs'].append({'time': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), 'user': key, 'text': text})  # Fixed: Use timezone.utc
+        context.bot_data['logs'].append({'time': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), 'user': key, 'text': text})
         return
 
     # Record user message in history and logs
     hist = context.bot_data['histories'].setdefault(key, [])
     hist.append({'role': 'user', 'content': text})
-    context.bot_data['logs'].append({'time': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), 'user': key, 'text': text})  # Fixed: Use timezone.utc
+    context.bot_data['logs'].append({'time': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), 'user': key, 'text': text})
 
     # Prepare messages for LLM
     system_msgs = []
