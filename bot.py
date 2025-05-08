@@ -28,7 +28,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_IDS = {641606456}  # Telegram IDs of admins
 BASE_URL = "https://cpanda.app"
-SCRAPE_PATHS = ["/", "/page/payment", "/policy", "/app-plus-subscription-policy"]
+SCRAPE_PATHS = ["/", "/page/payment", "/policy", "/cpanda.app/page/ios-subscriptions"]
 CACHE_TTL = timedelta(minutes=5)
 EMBED_DIM = 1536
 TOP_K = 3
