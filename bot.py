@@ -26,7 +26,7 @@ except ImportError:
 # ----------------------- Configuration -----------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_IDS = os.getenv(ADMIN_IDS)  # Telegram IDs of admins
+ADMIN_IDS = os.getenv("ADMIN_IDS")  # Telegram IDs of admins
 BASE_URL = "https://cpanda.app"
 SCRAPE_PATHS = ["/", "/page/payment", "/policy", "/app-plus-subscription-policy"]
 CACHE_TTL = timedelta(minutes=5)
