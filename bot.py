@@ -12,6 +12,10 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes, JobQueue
 )
 from openai import OpenAI, RateLimitError
+from dotenv import load_dotenv  # Added for loading .env file
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Optional RAG dependencies
 try:
@@ -26,14 +30,15 @@ except ImportError:
 # ----------------------- Configuration -----------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_IDS = os.getenv("ADMIN_IDS")  # Telegram IDs of admins
+# Load ADMIN_IDS from environment variable
+ADMIN_IDS = set(int(id) for id in os.getenv("ADMIN_IDS").split(','))  # Default to 641606456 if not set
 BASE_URL = "https://cpanda.app"
 SCRAPE_PATHS = ["/", "/page/payment", "/policy", "/app-plus-subscription-policy"]
 CACHE_TTL = timedelta(minutes=5)
 EMBED_DIM = 1536
 TOP_K = 3
 
-# Predefined list of known apps (for validation)
+# Hardcoded list of known apps as a fallback
 KNOWN_APPS = {'pubg star', 'agar.io'}  # Add more apps as needed
 
 # ----------------------- Logging Setup -----------------------
@@ -271,6 +276,7 @@ async def scrape_app_list(path, force_refresh=False):
     except Exception as e:
         logger.error(f"scrape_app_list error {path}: {e}")
         app_list = []
+        return app_list  # Explicitly return empty list on failure
 
     cache[path] = (now, app_list)
     scrape_app_list.cache = cache
@@ -392,8 +398,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data['queries_per_day'][today] = context.bot_data['queries_per_day'].get(today, 0) + 1
 
         scraped_apps = await scrape_app_list('/page/ios-subscriptions', force_refresh=True)
-        # Do not include manual apps for now to isolate the issue
-        combined_apps = scraped_apps
+        if not scraped_apps:
+            logger.warning(f"No apps scraped from {BASE_URL}/page/ios-subscriptions, using fallback.")
+            combined_apps = [{'name': app, 'features': ['Known app'], 'path': 'fallback', 'source': 'fallback'} for app in KNOWN_APPS]
+        else:
+            combined_apps = scraped_apps
         matching_apps = [app for app in combined_apps if app_query.lower() == app['name'].lower()]
         logger.info(f"Scraped apps: {[app['name'] for app in scraped_apps]}")
         logger.info(f"App query '{app_query}' compared with: {[app['name'] for app in combined_apps]}")
