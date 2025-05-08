@@ -31,7 +31,7 @@ except ImportError:
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # Load ADMIN_IDS from environment variable
-ADMIN_IDS = set(int(id) for id in os.getenv("ADMIN_IDS").split(','))  # Default to 641606456 if not set
+ADMIN_IDS = set(int(id) for id in os.getenv("ADMIN_IDS", "641606456").split(','))  # Default to 641606456 if not set
 BASE_URL = "https://cpanda.app"
 SCRAPE_PATHS = ["/", "/page/payment", "/policy", "/app-plus-subscription-policy"]
 CACHE_TTL = timedelta(minutes=5)
