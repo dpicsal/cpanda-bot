@@ -3,15 +3,14 @@ import logging
 import aiohttp
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, ContextTypes, JobQueue
 )
 from openai import OpenAI, RateLimitError
+import uuid
 
 # Optional RAG dependencies
 try:
@@ -28,13 +27,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_IDS = {641606456}  # Telegram IDs of admins
 BASE_URL = "https://cpanda.app"
-SCRAPE_PATHS = ["/", "/page/payment", "/policy", "/cpanda.app/page/ios-subscriptions"]
-CACHE_TTL = timedelta(minutes=5)
+SCRAPE_PATHS = ["/", "/page/payment", "/policy", "/app-plus-subscription-policy"]
+CACHE_TTL = timedelta(hours=1)  # Updated to 1 hour
 EMBED_DIM = 1536
 TOP_K = 3
-
-# Predefined list of known apps (for validation)
-KNOWN_APPS = {'pubg star', 'agar.io'}  # Add more apps as needed
 
 # ----------------------- Logging Setup -----------------------
 logging.basicConfig(
@@ -124,6 +120,7 @@ def init_bot_data(ctx):
     d.setdefault('most_asked_apps', {})
     d.setdefault('admin_notes', {})
     d.setdefault('pinned_chats', set())
+    d.setdefault('cache', {})  # Persistent cache storage
 
 # ----------------------- Admin Panels -----------------------
 def get_admin_panel():
@@ -193,9 +190,9 @@ def get_live_chats_panel():
     return InlineKeyboardMarkup(keyboard)
 
 # ----------------------- Scraping Utilities -----------------------
-async def fetch_page_text(path):
+async def fetch_page_text(path, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(timezone.utc)
-    cache = getattr(fetch_page_text, 'cache', {})
+    cache = context.bot_data.setdefault('cache', {})
     ts, content = cache.get(path, (None, None))
     if ts and now - ts < CACHE_TTL:
         return content
@@ -211,17 +208,12 @@ async def fetch_page_text(path):
         logger.error(f"fetch_page_text error {path}: {e}")
         content = 'Content unavailable.'
     cache[path] = (now, content)
-    fetch_page_text.cache = cache
+    context.bot_data['cache'] = cache
     return content
 
 async def scrape_app_list(path, force_refresh=False):
-    """
-    Scrapes the iOS subscriptions page for a list of available apps and their features.
-    Returns a list of dictionaries with app names, features, and metadata.
-    force_refresh: If True, bypasses cache and fetches fresh data.
-    """
     now = datetime.now(timezone.utc)
-    cache = getattr(scrape_app_list, 'cache', {})
+    cache = context.bot_data.setdefault('cache', {})
     if not force_refresh:
         ts, app_list = cache.get(path, (None, None))
         if ts and now - ts < CACHE_TTL:
@@ -238,42 +230,37 @@ async def scrape_app_list(path, force_refresh=False):
             logger.info(f"HTML Snippet for {path}: {html[:200]}")
         soup = BeautifulSoup(html, 'html.parser')
         
-        for section in soup.find_all(['h2', 'h3']):
-            app_name = section.get_text(strip=True)
-            # Enhanced filtering for app names
-            if (app_name.lower() in ['subscription packages', 'alert', 'close'] or
-                len(app_name) < 3 or len(app_name) > 50 or
-                any(keyword in app_name.lower() for keyword in ['like', 'similar', 'policy', 'about', 'features', 'description', 'overview']) or
-                not app_name.replace(' ', '').isalnum() or
-                any(char in app_name for char in ['!', '@', '#', '$', '%', '^', '&', '*'])):
+        # Assuming apps are in divs with a specific class or structure
+        for app_section in soup.select('div, section, article'):  # Adjust selector based on page structure
+            name_tag = app_section.find(['h2', 'h3', 'h4'])
+            if not name_tag:
                 continue
-            # Validate against known apps
-            if app_name.lower() not in KNOWN_APPS:
-                logger.info(f"App '{app_name}' not in known apps list, skipping.")
+            app_name = name_tag.get_text(strip=True)
+            if not app_name or len(app_name) < 3 or len(app_name) > 100:
                 continue
             features = []
-            for sib in section.next_siblings:
-                if getattr(sib, 'name', None) in ['h2', 'h3']:
-                    break
-                if hasattr(sib, 'get_text'):
-                    txt = sib.get_text(strip=True)
+            feature_container = app_section.find('ul') or app_section.find('div')
+            if feature_container:
+                for item in feature_container.find_all(['li', 'p']):
+                    txt = item.get_text(strip=True)
                     if txt:
                         features.append(txt)
-            if features:
-                app_list.append({
-                    'name': app_name,
-                    'features': features,
-                    'path': path,
-                    'heading': app_name,
-                    'source': 'scraped'
-                })
+            if not features:
+                features = [app_section.get_text(strip=True).split('\n')[1:][:5]]  # Fallback
+            app_list.append({
+                'name': app_name,
+                'features': features,
+                'path': path,
+                'heading': app_name,
+                'source': 'scraped'
+            })
         logger.info(f"Scraped apps from {path}: {[app['name'] for app in app_list]}")
     except Exception as e:
         logger.error(f"scrape_app_list error {path}: {e}")
         app_list = []
 
     cache[path] = (now, app_list)
-    scrape_app_list.cache = cache
+    context.bot_data['cache'] = cache
     return app_list
 
 # ----------------------- Handlers -----------------------
@@ -392,11 +379,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data['queries_per_day'][today] = context.bot_data['queries_per_day'].get(today, 0) + 1
 
         scraped_apps = await scrape_app_list('/page/ios-subscriptions', force_refresh=True)
-        # Do not include manual apps for now to isolate the issue
-        combined_apps = scraped_apps
-        matching_apps = [app for app in combined_apps if app_query.lower() == app['name'].lower()]
+        matching_apps = [app for app in scraped_apps if app_query.lower() == app['name'].lower()]
         logger.info(f"Scraped apps: {[app['name'] for app in scraped_apps]}")
-        logger.info(f"App query '{app_query}' compared with: {[app['name'] for app in combined_apps]}")
         logger.info(f"App query '{app_query}' matched: {bool(matching_apps)}")
         if matching_apps:
             logger.info(f"Matched app source: {matching_apps[0]['source']}")
@@ -404,7 +388,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if matching_apps:
             app = matching_apps[0]
             response = f"✅ **{app['name']}** is available on Panda AppStore!\n\nFeatures:\n- " + "\n- ".join(app['features'][:5])
-            response += "\n\nℹ️ Note: The Apps Plus subscription system is currently suspended. Check https://cpanda.app/page/ios-subscriptions for updates."
+            response += "\n\nℹ️ Note: The Apps Plus subscription system is currently suspended. Check https://cpanda.app/page/ios-subscriptions for updates."[](https://cpanda.app/page/android-subscriptions)
         else:
             response = f"❌ Sorry, **{app_query}** is not listed on https://cpanda.app/page/ios-subscriptions. Try another app or contact support at https://cpanda.app/contact."
         await update.message.reply_text(response)
@@ -490,14 +474,11 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text("No banned users.", reply_markup=get_admin_panel())
             return
         buttons = [[InlineKeyboardButton(f"{u}", callback_data=f"unban_user:{u}")] for u in banned]
-        await query.message.reply_text("Select a user to unban:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back_to_main")]]))
+        await query.message.reply_text("Select a user to unban:", reply markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back_to_main")]]))
         return
 
     if data == "admin_refresh_cache":
-        if hasattr(fetch_page_text, 'cache'):
-            fetch_page_text.cache = {}
-        if hasattr(scrape_app_list, 'cache'):
-            scrape_app_list.cache = {}
+        context.bot_data['cache'] = {}
         await query.message.reply_text("Caches refreshed.", reply_markup=get_admin_panel())
         return
 
