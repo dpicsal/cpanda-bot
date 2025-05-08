@@ -2,7 +2,7 @@ import os
 import logging
 import aiohttp
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta, timezone  # Added timezone import
+from datetime import datetime, timedelta, timezone
 from telegram import (
     Update, ReplyKeyboardMarkup, ReplyKeyboardRemove,
     InlineKeyboardButton, InlineKeyboardMarkup
@@ -138,7 +138,7 @@ REMOVE_MENU = ReplyKeyboardRemove()
 
 # ----------------------- Scraping Utilities -----------------------
 async def fetch_page_text(path):
-    now = datetime.now(timezone.UTC)  # Fixed: Use timezone-aware UTC datetime
+    now = datetime.now(timezone.utc)  # Fixed: Use timezone.utc
     cache = getattr(fetch_page_text, 'cache', {})
     ts, content = cache.get(path, (None, None))
     if ts and now - ts < CACHE_TTL:
@@ -162,7 +162,7 @@ async def scrape_app_list(path):
     Scrapes the iOS subscriptions page for a list of available apps and their features.
     Returns a list of dictionaries with app names, features, and metadata.
     """
-    now = datetime.now(timezone.UTC)  # Fixed: Use timezone-aware UTC datetime
+    now = datetime.now(timezone.utc)  # Fixed: Use timezone.utc
     cache = getattr(scrape_app_list, 'cache', {})
     ts, app_list = cache.get(path, (None, None))
     if ts and now - ts < CACHE_TTL:
@@ -282,13 +282,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hist = context.bot_data['histories'].setdefault(key, [])
         hist.append({'role': 'user', 'content': text})
         hist.append({'role': 'assistant', 'content': response})
-        context.bot_data['logs'].append({'time': datetime.now(timezone.UTC).strftime('%Y-%m-%d %H:%M:%S'), 'user': key, 'text': text})  # Fixed: Use timezone-aware UTC datetime
+        context.bot_data['logs'].append({'time': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), 'user': key, 'text': text})  # Fixed: Use timezone.utc
         return
 
     # Record user message in history and logs
     hist = context.bot_data['histories'].setdefault(key, [])
     hist.append({'role': 'user', 'content': text})
-    context.bot_data['logs'].append({'time': datetime.now(timezone.UTC).strftime('%Y-%m-%d %H:%M:%S'), 'user': key, 'text': text})  # Fixed: Use timezone-aware UTC datetime
+    context.bot_data['logs'].append({'time': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), 'user': key, 'text': text})  # Fixed: Use timezone.utc
 
     # Prepare messages for LLM
     system_msgs = []
