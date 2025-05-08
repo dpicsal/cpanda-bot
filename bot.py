@@ -10,7 +10,7 @@ from telegram import (
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters, ContextTypes
+    CallbackQueryHandler, filters, ContextTypes, JobQueue
 )
 from openai import OpenAI, RateLimitError
 
@@ -120,8 +120,9 @@ def init_bot_data(ctx):
     d.setdefault('manual_apps', {})
     d.setdefault('queries_per_day', {})
     d.setdefault('most_asked_apps', {})
+    d.setdefault('admin_notes', {})
 
-# ----------------------- Admin Panel -----------------------
+# ----------------------- Admin Panels -----------------------
 def get_admin_panel():
     keyboard = [
         [
@@ -137,6 +138,14 @@ def get_admin_panel():
             InlineKeyboardButton("Broadcast Message", callback_data="admin_broadcast"),
         ],
         [
+            InlineKeyboardButton("More Options", callback_data="admin_more_options"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_admin_more_options_panel():
+    keyboard = [
+        [
             InlineKeyboardButton(f"RAG: {'On' if RAG_ENABLED else 'Off'}", callback_data="admin_toggle_rag"),
             InlineKeyboardButton("Manage Apps", callback_data="admin_manage_apps"),
         ],
@@ -147,6 +156,10 @@ def get_admin_panel():
         [
             InlineKeyboardButton("Send Notification", callback_data="admin_send_notification"),
             InlineKeyboardButton("View All Chats", callback_data="admin_view_all_chats"),
+        ],
+        [
+            InlineKeyboardButton("Add Admin Note", callback_data="admin_add_note"),
+            InlineKeyboardButton("Back", callback_data="admin_back_to_main"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -159,7 +172,10 @@ def get_manage_apps_panel():
         ],
         [
             InlineKeyboardButton("View Manual Apps", callback_data="admin_view_manual_apps"),
-            InlineKeyboardButton("Back", callback_data="admin_back"),
+            InlineKeyboardButton("Clear Manual Apps", callback_data="admin_clear_manual_apps"),
+        ],
+        [
+            InlineKeyboardButton("Back", callback_data="admin_more_options"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -168,6 +184,9 @@ def get_chat_view_panel(user_id):
     keyboard = [
         [
             InlineKeyboardButton("Reply to User", callback_data=f"admin_reply_to_user:{user_id}"),
+            InlineKeyboardButton("Refresh Chat", callback_data=f"view_chat:{user_id}"),
+        ],
+        [
             InlineKeyboardButton("Back", callback_data="admin_view_all_chats"),
         ],
     ]
@@ -215,6 +234,8 @@ async def scrape_app_list(path, force_refresh=False):
             resp = await session.get(BASE_URL + path)
             resp.raise_for_status()
             html = await resp.text()
+            logger.info(f"HTTP Status for {path}: {resp.status}")
+            logger.info(f"HTML Snippet for {path}: {html[:200]}")  # Log first 200 chars
         soup = BeautifulSoup(html, 'html.parser')
         
         for section in soup.find_all(['h2', 'h3']):
@@ -222,8 +243,9 @@ async def scrape_app_list(path, force_refresh=False):
             # Enhanced filtering for app names
             if (app_name.lower() in ['subscription packages', 'alert', 'close'] or
                 len(app_name) < 3 or len(app_name) > 50 or
-                any(keyword in app_name.lower() for keyword in ['like', 'similar', 'policy', 'about', 'features']) or
-                not app_name.replace(' ', '').isalnum()):  # Ensure only alphanumeric and spaces
+                any(keyword in app_name.lower() for keyword in ['like', 'similar', 'policy', 'about', 'features', 'description', 'overview']) or
+                not app_name.replace(' ', '').isalnum() or
+                any(char in app_name for char in ['!', '@', '#', '$', '%', '^', '&', '*'])):
                 continue
             features = []
             for sib in section.next_siblings:
@@ -245,7 +267,6 @@ async def scrape_app_list(path, force_refresh=False):
     except Exception as e:
         logger.error(f"scrape_app_list error {path}: {e}")
         app_list = []
-        return app_list  # Explicitly return empty list on failure
 
     cache[path] = (now, app_list)
     scrape_app_list.cache = cache
@@ -337,10 +358,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message = update.message.text
             try:
                 await context.bot.send_message(chat_id=int(target_user), text=f"[Admin Reply]: {message}")
-                await update.message.reply_text(f"Reply sent to user {target_user}.", reply_markup=get_admin_panel())
+                await update.message.reply_text(f"Reply sent to user {target_user}.", reply_markup=get_chat_view_panel(target_user))
             except Exception as e:
                 await update.message.reply_text(f"Failed to send reply: {e}", reply_markup=get_admin_panel())
             context.user_data.pop('awaiting_admin_reply', None)
+            return
+        # Handle admin note addition
+        if context.user_data.get('awaiting_admin_note'):
+            target_user = context.user_data['awaiting_admin_note']
+            note = update.message.text
+            context.bot_data['admin_notes'][target_user] = note
+            context.user_data.pop('awaiting_admin_note', None)
+            await update.message.reply_text(f"Note added for user {target_user}.", reply_markup=get_admin_panel())
             return
 
     # Check for app availability query
@@ -432,7 +461,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text("No users found.", reply_markup=get_admin_panel())
             return
         buttons = [[InlineKeyboardButton(f"{u}: @{info['username']}", callback_data=f"view_user:{u}")] for u, info in users.items()]
-        await query.message.reply_text("Select a user:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back")]]))
+        await query.message.reply_text("Select a user:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back_to_main")]]))
         return
 
     if data == "admin_view_logs":
@@ -450,7 +479,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text("No users to ban.", reply_markup=get_admin_panel())
             return
         buttons = [[InlineKeyboardButton(f"{u}: @{info['username']}", callback_data=f"ban_user:{u}")] for u, info in users.items()]
-        await query.message.reply_text("Select a user to ban:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back")]]))
+        await query.message.reply_text("Select a user to ban:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back_to_main")]]))
         return
 
     if data == "admin_unban_user":
@@ -459,7 +488,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text("No banned users.", reply_markup=get_admin_panel())
             return
         buttons = [[InlineKeyboardButton(f"{u}", callback_data=f"unban_user:{u}")] for u in banned]
-        await query.message.reply_text("Select a user to unban:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back")]]))
+        await query.message.reply_text("Select a user to unban:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back_to_main")]]))
         return
 
     if data == "admin_refresh_cache":
@@ -472,7 +501,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     if data == "admin_broadcast":
         context.user_data['awaiting_broadcast'] = True
-        await query.message.reply_text("Please enter the message to broadcast:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin_back")]]))
+        await query.message.reply_text("Please enter the message to broadcast:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin_back_to_main")]]))
         return
 
     if data == "admin_toggle_rag":
@@ -483,13 +512,17 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text(f"RAG is now {'enabled' if context.bot_data['rag_enabled'] else 'disabled'}.", reply_markup=get_admin_panel())
         return
 
+    if data == "admin_more_options":
+        await query.message.reply_text("More Options:", reply_markup=get_admin_more_options_panel())
+        return
+
     if data == "admin_manage_apps":
         await query.message.reply_text("Manage Apps:", reply_markup=get_manage_apps_panel())
         return
 
     if data == "admin_add_app":
         context.user_data['awaiting_app_add'] = True
-        await query.message.reply_text("Please enter the app name to add:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin_back")]]))
+        await query.message.reply_text("Please enter the app name to add:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin_more_options")]]))
         return
 
     if data == "admin_remove_app":
@@ -498,7 +531,12 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text("No manually added apps to remove.", reply_markup=get_admin_panel())
             return
         buttons = [[InlineKeyboardButton(app_name, callback_data=f"remove_app:{app_name}")] for app_name in manual_apps.keys()]
-        await query.message.reply_text("Select an app to remove:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back")]]))
+        await query.message.reply_text("Select an app to remove:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_more_options")]]))
+        return
+
+    if data == "admin_clear_manual_apps":
+        context.bot_data['manual_apps'].clear()
+        await query.message.reply_text("All manually added apps cleared.", reply_markup=get_admin_panel())
         return
 
     if data == "admin_view_manual_apps":
@@ -526,7 +564,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             return
         buttons = [[InlineKeyboardButton(f"{u}: @{info['username']}", callback_data=f"clear_history:{u}")] for u, info in users.items()]
         buttons.append([InlineKeyboardButton("Clear All Histories", callback_data="clear_all_histories")])
-        buttons.append([InlineKeyboardButton("Back", callback_data="admin_back")])
+        buttons.append([InlineKeyboardButton("Back", callback_data="admin_more_options")])
         await query.message.reply_text("Select a user to clear history:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
@@ -536,7 +574,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text("No users to notify.", reply_markup=get_admin_panel())
             return
         buttons = [[InlineKeyboardButton(f"{u}: @{info['username']}", callback_data=f"send_notification:{u}")] for u, info in users.items()]
-        await query.message.reply_text("Select a user to send a notification:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back")]]))
+        await query.message.reply_text("Select a user to send a notification:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_more_options")]]))
         return
 
     if data == "admin_view_all_chats":
@@ -545,17 +583,28 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text("No users found.", reply_markup=get_admin_panel())
             return
         buttons = [[InlineKeyboardButton(f"{u}: @{info['username']}", callback_data=f"view_chat:{u}")] for u, info in users.items()]
-        await query.message.reply_text("Select a user to view their chats:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back")]]))
+        await query.message.reply_text("Select a user to view their chats:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_more_options")]]))
+        return
+
+    if data == "admin_add_note":
+        users = context.bot_data['users_info']
+        if not users:
+            await query.message.reply_text("No users to add notes for.", reply_markup=get_admin_panel())
+            return
+        buttons = [[InlineKeyboardButton(f"{u}: @{info['username']}", callback_data=f"add_note:{u}")] for u, info in users.items()]
+        await query.message.reply_text("Select a user to add a note:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_more_options")]]))
         return
 
     if data.startswith("view_chat:"):
         target = data.split(':', 1)[1]
         info = context.bot_data['users_info'].get(target, {})
         hist = context.bot_data['histories'].get(target, [])
+        note = context.bot_data['admin_notes'].get(target, "No notes.")
         if not hist:
             await query.message.reply_text(f"No chat history for user {target}.", reply_markup=get_admin_panel())
             return
         lines = [f"Chat History for {target}: @{info.get('username')} ({info.get('name')})"]
+        lines.append(f"Admin Note: {note}")
         lines += [f"{m['role']}: {m['content']}" for m in hist[-10:]]
         await query.message.reply_text('\n'.join(lines), reply_markup=get_chat_view_panel(target))
         return
@@ -563,7 +612,13 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     if data.startswith("admin_reply_to_user:"):
         target = data.split(':', 1)[1]
         context.user_data['awaiting_admin_reply'] = target
-        await query.message.reply_text("Please enter your reply message:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin_view_all_chats")]]))
+        await query.message.reply_text("Please enter your reply message:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="view_chat:" + target)]]))
+        return
+
+    if data.startswith("add_note:"):
+        target = data.split(':', 1)[1]
+        context.user_data['awaiting_admin_note'] = target
+        await query.message.reply_text("Please enter the note for the user:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin_more_options")]]))
         return
 
     if data.startswith("view_user:"):
@@ -607,11 +662,15 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     if data.startswith("send_notification:"):
         target = data.split(':', 1)[1]
         context.user_data['awaiting_notification'] = target
-        await query.message.reply_text("Please enter the notification message:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin_back")]]))
+        await query.message.reply_text("Please enter the notification message:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin_more_options")]]))
+        return
+
+    if data == "admin_back_to_main":
+        await query.message.reply_text("Admin Panel:", reply_markup=get_admin_panel())
         return
 
     if data == "admin_back":
-        await query.message.reply_text("Admin Panel:", reply_markup=get_admin_panel())
+        await query.message.reply_text("More Options:", reply_markup=get_admin_more_options_panel())
         return
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -619,15 +678,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    if data.startswith("admin_") or data.startswith("view_user:") or data.startswith("ban_user:") or data.startswith("unban_user:") or data.startswith("remove_app:") or data.startswith("clear_history:") or data.startswith("send_notification:") or data.startswith("view_chat:"):
+    if data.startswith("admin_") or data.startswith("view_user:") or data.startswith("ban_user:") or data.startswith("unban_user:") or data.startswith("remove_app:") or data.startswith("clear_history:") or data.startswith("send_notification:") or data.startswith("view_chat:") or data.startswith("add_note:"):
         await admin_callback_handler(update, context)
         return
 
-    if data in ["admin_back", "admin_view_all_chats"] and (context.user_data.get('awaiting_broadcast') or context.user_data.get('awaiting_notification') or context.user_data.get('awaiting_app_add') or context.user_data.get('awaiting_admin_reply')):
+    if data.startswith("admin_") or data.startswith("view_chat:") and (context.user_data.get('awaiting_broadcast') or context.user_data.get('awaiting_notification') or context.user_data.get('awaiting_app_add') or context.user_data.get('awaiting_admin_reply') or context.user_data.get('awaiting_admin_note')):
         context.user_data.pop('awaiting_broadcast', None)
         context.user_data.pop('awaiting_notification', None)
         context.user_data.pop('awaiting_app_add', None)
         context.user_data.pop('awaiting_admin_reply', None)
+        context.user_data.pop('awaiting_admin_note', None)
         await query.message.reply_text("Action cancelled.", reply_markup=get_admin_panel())
         return
 
