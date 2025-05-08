@@ -13,7 +13,6 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes
 )
 from openai import OpenAI, RateLimitError
-import difflib
 
 # Optional RAG dependencies
 try:
@@ -117,7 +116,10 @@ def init_bot_data(ctx):
     d.setdefault('last_time', {})
     d.setdefault('banned', set())
     d.setdefault('users_info', {})
-    d.setdefault('rag_enabled', RAG_ENABLED)  # Track RAG state
+    d.setdefault('rag_enabled', RAG_ENABLED)
+    d.setdefault('manual_apps', {})  # Store manually added apps
+    d.setdefault('queries_per_day', {})  # Track queries per day for stats
+    d.setdefault('most_asked_apps', {})  # Track most asked apps
 
 # ----------------------- Admin Panel -----------------------
 def get_admin_panel():
@@ -136,6 +138,27 @@ def get_admin_panel():
         ],
         [
             InlineKeyboardButton(f"RAG: {'On' if RAG_ENABLED else 'Off'}", callback_data="admin_toggle_rag"),
+            InlineKeyboardButton("Manage Apps", callback_data="admin_manage_apps"),
+        ],
+        [
+            InlineKeyboardButton("View Stats", callback_data="admin_view_stats"),
+            InlineKeyboardButton("Clear History", callback_data="admin_clear_history"),
+        ],
+        [
+            InlineKeyboardButton("Send Notification", callback_data="admin_send_notification"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_manage_apps_panel():
+    keyboard = [
+        [
+            InlineKeyboardButton("Add App", callback_data="admin_add_app"),
+            InlineKeyboardButton("Remove App", callback_data="admin_remove_app"),
+        ],
+        [
+            InlineKeyboardButton("View Manual Apps", callback_data="admin_view_manual_apps"),
+            InlineKeyboardButton("Back", callback_data="admin_back"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -186,7 +209,10 @@ async def scrape_app_list(path, force_refresh=False):
         
         for section in soup.find_all(['h2', 'h3']):
             app_name = section.get_text(strip=True)
-            if app_name.lower() in ['subscription packages', 'alert', 'close']:
+            # Stricter filtering for app names
+            if (app_name.lower() in ['subscription packages', 'alert', 'close'] or
+                len(app_name) < 3 or len(app_name) > 50 or
+                any(keyword in app_name.lower() for keyword in ['like', 'similar', 'policy'])):
                 continue
             features = []
             for sib in section.next_siblings:
@@ -234,7 +260,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             'Welcome to Panda AppStore! How can I assist you today?',
-            reply_markup=ReplyKeyboardRemove()  # Remove any existing menu
+            reply_markup=ReplyKeyboardRemove()
         )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -248,7 +274,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You are banned from using this bot.")
         return
 
-    # Handle admin commands via text (if needed)
+    # Handle admin text commands
     if uid in ADMIN_IDS:
         if text == 'panel':
             await update.message.reply_text(
@@ -256,8 +282,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=get_admin_panel()
             )
             return
-        # Allow admins to use the bot as a regular user for queries
-        # Fall through to regular user logic
+        # Handle broadcast message input
+        if context.user_data.get('awaiting_broadcast'):
+            message = update.message.text
+            users = context.bot_data['users_info']
+            for user_id in users:
+                try:
+                    await context.bot.send_message(chat_id=int(user_id), text=message)
+                except Exception as e:
+                    logger.error(f"Failed to send broadcast to {user_id}: {e}")
+            context.user_data.pop('awaiting_broadcast', None)
+            await update.message.reply_text("Broadcast sent.", reply_markup=get_admin_panel())
+            return
+        # Handle custom notification input
+        if context.user_data.get('awaiting_notification'):
+            message = update.message.text
+            target_user = context.user_data['awaiting_notification']
+            try:
+                await context.bot.send_message(chat_id=int(target_user), text=message)
+                await update.message.reply_text(f"Notification sent to user {target_user}.", reply_markup=get_admin_panel())
+            except Exception as e:
+                await update.message.reply_text(f"Failed to send notification: {e}", reply_markup=get_admin_panel())
+            context.user_data.pop('awaiting_notification', None)
+            return
+        # Handle manual app addition
+        if context.user_data.get('awaiting_app_add'):
+            app_name = update.message.text.strip()
+            context.bot_data['manual_apps'][app_name.lower()] = {
+                'name': app_name,
+                'features': ['Manually added app'],
+                'path': 'manual',
+                'heading': app_name
+            }
+            context.user_data.pop('awaiting_app_add', None)
+            await update.message.reply_text(f"App '{app_name}' added.", reply_markup=get_admin_panel())
+            return
 
     # Check for app availability query
     app_query = None
@@ -269,18 +328,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         app_query = text
 
     if app_query:
+        # Track most asked apps
+        context.bot_data['most_asked_apps'][app_query] = context.bot_data['most_asked_apps'].get(app_query, 0) + 1
+        # Track queries per day
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        context.bot_data['queries_per_day'][today] = context.bot_data['queries_per_day'].get(today, 0) + 1
+
         app_list = await scrape_app_list('/page/ios-subscriptions', force_refresh=True)
-        matching_apps = [app for app in app_list if app_query.lower() == app['name'].lower()]
-        if not matching_apps:
-            matching_apps = [
-                app for app in app_list
-                if difflib.SequenceMatcher(None, app_query.lower(), app['name'].lower()).ratio() > 0.95
-            ]
-            match_scores = [
-                (app['name'], difflib.SequenceMatcher(None, app_query.lower(), app['name'].lower()).ratio())
-                for app in app_list
-            ]
-            logger.info(f"App query '{app_query}' match scores: {match_scores}")
+        # Include manually added apps
+        manual_apps = list(context.bot_data['manual_apps'].values())
+        combined_apps = app_list + manual_apps
+        # Exact match only (case-insensitive)
+        matching_apps = [app for app in combined_apps if app_query.lower() == app['name'].lower()]
+        logger.info(f"App query '{app_query}' compared with: {[app['name'] for app in combined_apps]}")
         logger.info(f"App query '{app_query}' matched: {bool(matching_apps)}")
 
         if matching_apps:
@@ -349,7 +409,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     if data == "admin_view_logs":
-        logs = context.bot_data['logs'][-10:]  # Last 10 log entries
+        logs = context.bot_data['logs'][-10:]
         if not logs:
             await query.message.reply_text("No logs available.", reply_markup=get_admin_panel())
             return
@@ -376,7 +436,6 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     if data == "admin_refresh_cache":
-        # Clear caches
         if hasattr(fetch_page_text, 'cache'):
             fetch_page_text.cache = {}
         if hasattr(scrape_app_list, 'cache'):
@@ -395,6 +454,62 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             return
         context.bot_data['rag_enabled'] = not context.bot_data.get('rag_enabled', RAG_ENABLED)
         await query.message.reply_text(f"RAG is now {'enabled' if context.bot_data['rag_enabled'] else 'disabled'}.", reply_markup=get_admin_panel())
+        return
+
+    if data == "admin_manage_apps":
+        await query.message.reply_text("Manage Apps:", reply_markup=get_manage_apps_panel())
+        return
+
+    if data == "admin_add_app":
+        context.user_data['awaiting_app_add'] = True
+        await query.message.reply_text("Please enter the app name to add:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin_back")]]))
+        return
+
+    if data == "admin_remove_app":
+        manual_apps = context.bot_data['manual_apps']
+        if not manual_apps:
+            await query.message.reply_text("No manually added apps to remove.", reply_markup=get_admin_panel())
+            return
+        buttons = [[InlineKeyboardButton(app_name, callback_data=f"remove_app:{app_name}")] for app_name in manual_apps.keys()]
+        await query.message.reply_text("Select an app to remove:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back")]]))
+        return
+
+    if data == "admin_view_manual_apps":
+        manual_apps = context.bot_data['manual_apps']
+        if not manual_apps:
+            await query.message.reply_text("No manually added apps.", reply_markup=get_admin_panel())
+            return
+        app_list = "\n".join([app['name'] for app in manual_apps.values()])
+        await query.message.reply_text(f"Manually Added Apps:\n{app_list}", reply_markup=get_admin_panel())
+        return
+
+    if data == "admin_view_stats":
+        total_users = len(context.bot_data['users_info'])
+        queries_today = context.bot_data['queries_per_day'].get(datetime.now(timezone.utc).strftime('%Y-%m-%d'), 0)
+        top_apps = sorted(context.bot_data['most_asked_apps'].items(), key=lambda x: x[1], reverse=True)[:5]
+        top_apps_text = "\n".join([f"{app}: {count} queries" for app, count in top_apps])
+        stats = f"Total Users: {total_users}\nQueries Today: {queries_today}\nTop Asked Apps:\n{top_apps_text}"
+        await query.message.reply_text(stats, reply_markup=get_admin_panel())
+        return
+
+    if data == "admin_clear_history":
+        users = context.bot_data['users_info']
+        if not users:
+            await query.message.reply_text("No users to clear history for.", reply_markup=get_admin_panel())
+            return
+        buttons = [[InlineKeyboardButton(f"{u}: @{info['username']}", callback_data=f"clear_history:{u}")] for u, info in users.items()]
+        buttons.append([InlineKeyboardButton("Clear All Histories", callback_data="clear_all_histories")])
+        buttons.append([InlineKeyboardButton("Back", callback_data="admin_back")])
+        await query.message.reply_text("Select a user to clear history:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data == "admin_send_notification":
+        users = context.bot_data['users_info']
+        if not users:
+            await query.message.reply_text("No users to notify.", reply_markup=get_admin_panel())
+            return
+        buttons = [[InlineKeyboardButton(f"{u}: @{info['username']}", callback_data=f"send_notification:{u}")] for u, info in users.items()]
+        await query.message.reply_text("Select a user to send a notification:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back")]]))
         return
 
     if data.startswith("view_user:"):
@@ -418,6 +533,29 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text(f"User {target} has been unbanned.", reply_markup=get_admin_panel())
         return
 
+    if data.startswith("remove_app:"):
+        app_name = data.split(':', 1)[1]
+        context.bot_data['manual_apps'].pop(app_name.lower(), None)
+        await query.message.reply_text(f"App '{app_name}' removed.", reply_markup=get_admin_panel())
+        return
+
+    if data.startswith("clear_history:"):
+        target = data.split(':', 1)[1]
+        context.bot_data['histories'].pop(target, None)
+        await query.message.reply_text(f"History for user {target} cleared.", reply_markup=get_admin_panel())
+        return
+
+    if data == "clear_all_histories":
+        context.bot_data['histories'].clear()
+        await query.message.reply_text("All user histories cleared.", reply_markup=get_admin_panel())
+        return
+
+    if data.startswith("send_notification:"):
+        target = data.split(':', 1)[1]
+        context.user_data['awaiting_notification'] = target
+        await query.message.reply_text("Please enter the notification message:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin_back")]]))
+        return
+
     if data == "admin_back":
         await query.message.reply_text("Admin Panel:", reply_markup=get_admin_panel())
         return
@@ -427,18 +565,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    # Handle admin panel callbacks
-    if data.startswith("admin_") or data.startswith("view_user:") or data.startswith("ban_user:") or data.startswith("unban_user:"):
+    if data.startswith("admin_") or data.startswith("view_user:") or data.startswith("ban_user:") or data.startswith("unban_user:") or data.startswith("remove_app:") or data.startswith("clear_history:") or data.startswith("send_notification:"):
         await admin_callback_handler(update, context)
         return
 
-    # Handle broadcast message cancellation
-    if data == "admin_back" and context.user_data.get('awaiting_broadcast'):
+    if data == "admin_back" and (context.user_data.get('awaiting_broadcast') or context.user_data.get('awaiting_notification') or context.user_data.get('awaiting_app_add')):
         context.user_data.pop('awaiting_broadcast', None)
-        await query.message.reply_text("Broadcast cancelled.", reply_markup=get_admin_panel())
+        context.user_data.pop('awaiting_notification', None)
+        context.user_data.pop('awaiting_app_add', None)
+        await query.message.reply_text("Action cancelled.", reply_markup=get_admin_panel())
         return
 
-    # Default callback handling (if any)
     await query.message.reply_text("Unknown action.", reply_markup=get_admin_panel() if query.from_user.id in ADMIN_IDS else None)
 
 # ----------------------- Main Entrypoint -----------------------
