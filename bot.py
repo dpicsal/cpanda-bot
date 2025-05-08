@@ -7,10 +7,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters, ContextTypes, JobQueue
+    CallbackQueryHandler, filters, ContextTypes
 )
 from openai import OpenAI, RateLimitError
-import uuid
 
 # Optional RAG dependencies
 try:
@@ -28,7 +27,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_IDS = {641606456}  # Telegram IDs of admins
 BASE_URL = "https://cpanda.app"
 SCRAPE_PATHS = ["/", "/page/payment", "/policy", "/app-plus-subscription-policy"]
-CACHE_TTL = timedelta(hours=1)  # Updated to 1 hour
+CACHE_TTL = timedelta(hours=1)
 EMBED_DIM = 1536
 TOP_K = 3
 
@@ -36,7 +35,8 @@ TOP_K = 3
 logging.basicConfig(
     filename="bot.log",
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    encoding="utf-8"
 )
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,7 @@ async def scrape_and_build_index():
             if parts:
                 documents.append({'text': '\n'.join(parts), 'path': path, 'heading': heading})
     
-    app_list = await scrape_app_list('/page/ios-subscriptions')
+    app_list = await scrape_app_list('/page/ios-subscriptions', context=None)
     for app in app_list:
         documents.append({
             'text': '\n'.join(app['features']),
@@ -120,7 +120,7 @@ def init_bot_data(ctx):
     d.setdefault('most_asked_apps', {})
     d.setdefault('admin_notes', {})
     d.setdefault('pinned_chats', set())
-    d.setdefault('cache', {})  # Persistent cache storage
+    d.setdefault('cache', {})
 
 # ----------------------- Admin Panels -----------------------
 def get_admin_panel():
@@ -211,10 +211,10 @@ async def fetch_page_text(path, context: ContextTypes.DEFAULT_TYPE):
     context.bot_data['cache'] = cache
     return content
 
-async def scrape_app_list(path, force_refresh=False):
+async def scrape_app_list(path, context: ContextTypes.DEFAULT_TYPE = None, force_refresh=False):
     now = datetime.now(timezone.utc)
-    cache = context.bot_data.setdefault('cache', {})
-    if not force_refresh:
+    cache = context.bot_data.setdefault('cache', {}) if context else {}
+    if not force_refresh and context:
         ts, app_list = cache.get(path, (None, None))
         if ts and now - ts < CACHE_TTL:
             logger.info(f"Using cached app list for {path}")
@@ -230,8 +230,7 @@ async def scrape_app_list(path, force_refresh=False):
             logger.info(f"HTML Snippet for {path}: {html[:200]}")
         soup = BeautifulSoup(html, 'html.parser')
         
-        # Assuming apps are in divs with a specific class or structure
-        for app_section in soup.select('div, section, article'):  # Adjust selector based on page structure
+        for app_section in soup.select('div, section, article'):
             name_tag = app_section.find(['h2', 'h3', 'h4'])
             if not name_tag:
                 continue
@@ -246,7 +245,7 @@ async def scrape_app_list(path, force_refresh=False):
                     if txt:
                         features.append(txt)
             if not features:
-                features = [app_section.get_text(strip=True).split('\n')[1:][:5]]  # Fallback
+                features = [app_section.get_text(strip=True).split('\n')[1:][:5]]
             app_list.append({
                 'name': app_name,
                 'features': features,
@@ -259,8 +258,9 @@ async def scrape_app_list(path, force_refresh=False):
         logger.error(f"scrape_app_list error {path}: {e}")
         app_list = []
 
-    cache[path] = (now, app_list)
-    context.bot_data['cache'] = cache
+    if context:
+        cache[path] = (now, app_list)
+        context.bot_data['cache'] = cache
     return app_list
 
 # ----------------------- Handlers -----------------------
@@ -306,7 +306,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=get_admin_panel()
             )
             return
-        # Handle broadcast message input
         if context.user_data.get('awaiting_broadcast'):
             message = update.message.text
             users = context.bot_data['users_info']
@@ -318,7 +317,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('awaiting_broadcast', None)
             await update.message.reply_text("Broadcast sent.", reply_markup=get_admin_panel())
             return
-        # Handle custom notification input
         if context.user_data.get('awaiting_notification'):
             message = update.message.text
             target_user = context.user_data['awaiting_notification']
@@ -329,7 +327,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Failed to send notification: {e}", reply_markup=get_admin_panel())
             context.user_data.pop('awaiting_notification', None)
             return
-        # Handle manual app addition
         if context.user_data.get('awaiting_app_add'):
             app_name = update.message.text.strip()
             context.bot_data['manual_apps'][app_name.lower()] = {
@@ -342,7 +339,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('awaiting_app_add', None)
             await update.message.reply_text(f"App '{app_name}' added.", reply_markup=get_admin_panel())
             return
-        # Handle admin reply to user
         if context.user_data.get('awaiting_admin_reply'):
             target_user = context.user_data['awaiting_admin_reply']
             message = update.message.text
@@ -353,7 +349,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Failed to send reply: {e}", reply_markup=get_admin_panel())
             context.user_data.pop('awaiting_admin_reply', None)
             return
-        # Handle admin note addition
         if context.user_data.get('awaiting_admin_note'):
             target_user = context.user_data['awaiting_admin_note']
             note = update.message.text
@@ -368,17 +363,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = text.split('is')[-1].split('available')[0].strip()
         if parts:
             app_query = parts
-    elif text in [d['name'].lower() for d in await scrape_app_list('/page/ios-subscriptions')]:
+    elif text in [d['name'].lower() for d in await scrape_app_list('/page/ios-subscriptions', context)]:
         app_query = text
 
     if app_query:
-        # Track most asked apps
         context.bot_data['most_asked_apps'][app_query] = context.bot_data['most_asked_apps'].get(app_query, 0) + 1
-        # Track queries per day
         today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
         context.bot_data['queries_per_day'][today] = context.bot_data['queries_per_day'].get(today, 0) + 1
 
-        scraped_apps = await scrape_app_list('/page/ios-subscriptions', force_refresh=True)
+        scraped_apps = await scrape_app_list('/page/ios-subscriptions', context, force_refresh=True)
         matching_apps = [app for app in scraped_apps if app_query.lower() == app['name'].lower()]
         logger.info(f"Scraped apps: {[app['name'] for app in scraped_apps]}")
         logger.info(f"App query '{app_query}' matched: {bool(matching_apps)}")
@@ -388,7 +381,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if matching_apps:
             app = matching_apps[0]
             response = f"✅ **{app['name']}** is available on Panda AppStore!\n\nFeatures:\n- " + "\n- ".join(app['features'][:5])
-            response += "\n\nℹ️ Note: The Apps Plus subscription system is currently suspended. Check https://cpanda.app/page/ios-subscriptions for updates."[](https://cpanda.app/page/android-subscriptions)
+            response += "\n\nInfo: The Apps Plus subscription system is currently suspended. Check https://cpanda.app/page/ios-subscriptions for updates."
         else:
             response = f"❌ Sorry, **{app_query}** is not listed on https://cpanda.app/page/ios-subscriptions. Try another app or contact support at https://cpanda.app/contact."
         await update.message.reply_text(response)
@@ -424,10 +417,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resp = client.chat.completions.create(model='gpt-4', messages=messages, max_tokens=200)
         reply = resp.choices[0].message.content.strip()
     except RateLimitError:
-        reply = '😅 Rate limited—please try again soon.'
+        reply = 'Rate limited—please try again soon.'
     except Exception as e:
         logger.error(f"Chat error: {e}")
-        reply = '⚠️ Something went wrong—please try again later.'
+        reply = 'Something went wrong—please try again later.'
 
     hist.append({'role': 'assistant', 'content': reply})
     await update.message.reply_text(reply)
@@ -474,7 +467,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text("No banned users.", reply_markup=get_admin_panel())
             return
         buttons = [[InlineKeyboardButton(f"{u}", callback_data=f"unban_user:{u}")] for u in banned]
-        await query.message.reply_text("Select a user to unban:", reply markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back_to_main")]]))
+        await query.message.reply_text("Select a user to unban:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_back_to_main")]]))
         return
 
     if data == "admin_refresh_cache":
@@ -569,8 +562,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         for user_id, hist in histories.items():
             info = context.bot_data['users_info'].get(user_id, {})
             last_msg = hist[-1] if hist else {'role': 'unknown', 'content': 'No messages'}
-            lines.append(f"User {user_id}: @{info.get('username', 'Unknown')} - {last_msg['role']}: {last_msg['content']}")
-            buttons = [[InlineKeyboardButton(f"Reply to {user_id}", callback_data=f"admin_reply_to_user:{user_id}")]]
+            lines.append(f"User {user_id}: @{info.get('username', 'Unknown')} - {last_msg['role']}: {last_msg['content'][:50]}...")
         await query.message.reply_text("\n".join(lines), reply_markup=get_live_chats_panel())
         return
 
@@ -594,7 +586,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         info = context.bot_data['users_info'].get(target, {})
         hist = context.bot_data['histories'].get(target, [])
         lines = [f"User {target}: @{info.get('username')} ({info.get('name')})"]
-        lines += [f"{m['role']}: {m['content']}" for m in hist[-10:]]
+        lines += [f"{m['role']}: {m['content'][:50]}..." for m in hist[-10:]]
         await query.message.reply_text('\n'.join(lines), reply_markup=get_admin_panel())
         return
 
@@ -646,11 +638,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    if data.startswith("admin_") or data.startswith("view_user:") or data.startswith("ban_user:") or data.startswith("unban_user:") or data.startswith("remove_app:") or data.startswith("clear_history:") or data.startswith("send_notification:") or data.startswith("view_chat:") or data.startswith("add_note:"):
+    if data.startswith("admin_") or data.startswith("view_user:") or data.startswith("ban_user:") or data.startswith("unban_user:") or data.startswith("remove_app:") or data.startswith("clear_history:") or data.startswith("send_notification:") or data.startswith("add_note:"):
         await admin_callback_handler(update, context)
         return
 
-    if data in ["admin_back", "admin_back_to_main", "admin_live_chats"] and (context.user_data.get('awaiting_broadcast') or context.user_data.get('awaiting_notification') or context.user_data.get('awaiting_app_add') or context.user_data.get('awaiting_admin_reply') or context.user_data.get('awaiting_admin_note')):
+    if data in ["admin_back", "admin_back_to_main", "admin_live_chats"] and (
+        context.user_data.get('awaiting_broadcast') or
+        context.user_data.get('awaiting_notification') or
+        context.user_data.get('awaiting_app_add') or
+        context.user_data.get('awaiting_admin_reply') or
+        context.user_data.get('awaiting_admin_note')
+    ):
         context.user_data.pop('awaiting_broadcast', None)
         context.user_data.pop('awaiting_notification', None)
         context.user_data.pop('awaiting_app_add', None)
