@@ -4,8 +4,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 from telegram import (
-    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove,
-    InlineKeyboardButton, InlineKeyboardMarkup
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -33,6 +32,9 @@ SCRAPE_PATHS = ["/", "/page/payment", "/policy", "/app-plus-subscription-policy"
 CACHE_TTL = timedelta(minutes=5)
 EMBED_DIM = 1536
 TOP_K = 3
+
+# Predefined list of known apps (for validation)
+KNOWN_APPS = {'pubg star', 'agar.io'}  # Add more apps as needed
 
 # ----------------------- Logging Setup -----------------------
 logging.basicConfig(
@@ -121,6 +123,7 @@ def init_bot_data(ctx):
     d.setdefault('queries_per_day', {})
     d.setdefault('most_asked_apps', {})
     d.setdefault('admin_notes', {})
+    d.setdefault('pinned_chats', set())
 
 # ----------------------- Admin Panels -----------------------
 def get_admin_panel():
@@ -138,6 +141,7 @@ def get_admin_panel():
             InlineKeyboardButton("Broadcast Message", callback_data="admin_broadcast"),
         ],
         [
+            InlineKeyboardButton("Live Chats", callback_data="admin_live_chats"),
             InlineKeyboardButton("More Options", callback_data="admin_more_options"),
         ],
     ]
@@ -155,10 +159,9 @@ def get_admin_more_options_panel():
         ],
         [
             InlineKeyboardButton("Send Notification", callback_data="admin_send_notification"),
-            InlineKeyboardButton("View All Chats", callback_data="admin_view_all_chats"),
+            InlineKeyboardButton("Add Admin Note", callback_data="admin_add_note"),
         ],
         [
-            InlineKeyboardButton("Add Admin Note", callback_data="admin_add_note"),
             InlineKeyboardButton("Back", callback_data="admin_back_to_main"),
         ],
     ]
@@ -180,14 +183,11 @@ def get_manage_apps_panel():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def get_chat_view_panel(user_id):
+def get_live_chats_panel():
     keyboard = [
         [
-            InlineKeyboardButton("Reply to User", callback_data=f"admin_reply_to_user:{user_id}"),
-            InlineKeyboardButton("Refresh Chat", callback_data=f"view_chat:{user_id}"),
-        ],
-        [
-            InlineKeyboardButton("Back", callback_data="admin_view_all_chats"),
+            InlineKeyboardButton("Refresh", callback_data="admin_live_chats"),
+            InlineKeyboardButton("Back", callback_data="admin_back_to_main"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -235,7 +235,7 @@ async def scrape_app_list(path, force_refresh=False):
             resp.raise_for_status()
             html = await resp.text()
             logger.info(f"HTTP Status for {path}: {resp.status}")
-            logger.info(f"HTML Snippet for {path}: {html[:200]}")  # Log first 200 chars
+            logger.info(f"HTML Snippet for {path}: {html[:200]}")
         soup = BeautifulSoup(html, 'html.parser')
         
         for section in soup.find_all(['h2', 'h3']):
@@ -246,6 +246,10 @@ async def scrape_app_list(path, force_refresh=False):
                 any(keyword in app_name.lower() for keyword in ['like', 'similar', 'policy', 'about', 'features', 'description', 'overview']) or
                 not app_name.replace(' ', '').isalnum() or
                 any(char in app_name for char in ['!', '@', '#', '$', '%', '^', '&', '*'])):
+                continue
+            # Validate against known apps
+            if app_name.lower() not in KNOWN_APPS:
+                logger.info(f"App '{app_name}' not in known apps list, skipping.")
                 continue
             features = []
             for sib in section.next_siblings:
@@ -293,8 +297,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(
-            'Welcome to Panda AppStore! How can I assist you today?',
-            reply_markup=ReplyKeyboardRemove()
+            'Welcome to Panda AppStore! How can I assist you today?'
         )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -358,7 +361,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message = update.message.text
             try:
                 await context.bot.send_message(chat_id=int(target_user), text=f"[Admin Reply]: {message}")
-                await update.message.reply_text(f"Reply sent to user {target_user}.", reply_markup=get_chat_view_panel(target_user))
+                await update.message.reply_text(f"Reply sent to user {target_user}.", reply_markup=get_live_chats_panel())
             except Exception as e:
                 await update.message.reply_text(f"Failed to send reply: {e}", reply_markup=get_admin_panel())
             context.user_data.pop('awaiting_admin_reply', None)
@@ -389,11 +392,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data['queries_per_day'][today] = context.bot_data['queries_per_day'].get(today, 0) + 1
 
         scraped_apps = await scrape_app_list('/page/ios-subscriptions', force_refresh=True)
-        manual_apps = list(context.bot_data['manual_apps'].values())
-        combined_apps = scraped_apps + manual_apps
+        # Do not include manual apps for now to isolate the issue
+        combined_apps = scraped_apps
         matching_apps = [app for app in combined_apps if app_query.lower() == app['name'].lower()]
         logger.info(f"Scraped apps: {[app['name'] for app in scraped_apps]}")
-        logger.info(f"Manual apps: {[app['name'] for app in manual_apps]}")
         logger.info(f"App query '{app_query}' compared with: {[app['name'] for app in combined_apps]}")
         logger.info(f"App query '{app_query}' matched: {bool(matching_apps)}")
         if matching_apps:
@@ -577,13 +579,18 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text("Select a user to send a notification:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_more_options")]]))
         return
 
-    if data == "admin_view_all_chats":
-        users = context.bot_data['users_info']
-        if not users:
-            await query.message.reply_text("No users found.", reply_markup=get_admin_panel())
+    if data == "admin_live_chats":
+        histories = context.bot_data['histories']
+        if not histories:
+            await query.message.reply_text("No user chats available.", reply_markup=get_admin_panel())
             return
-        buttons = [[InlineKeyboardButton(f"{u}: @{info['username']}", callback_data=f"view_chat:{u}")] for u, info in users.items()]
-        await query.message.reply_text("Select a user to view their chats:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_more_options")]]))
+        lines = ["Live Chats Dashboard:"]
+        for user_id, hist in histories.items():
+            info = context.bot_data['users_info'].get(user_id, {})
+            last_msg = hist[-1] if hist else {'role': 'unknown', 'content': 'No messages'}
+            lines.append(f"User {user_id}: @{info.get('username', 'Unknown')} - {last_msg['role']}: {last_msg['content']}")
+            buttons = [[InlineKeyboardButton(f"Reply to {user_id}", callback_data=f"admin_reply_to_user:{user_id}")]]
+        await query.message.reply_text("\n".join(lines), reply_markup=get_live_chats_panel())
         return
 
     if data == "admin_add_note":
@@ -595,30 +602,10 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text("Select a user to add a note:", reply_markup=InlineKeyboardMarkup(buttons + [[InlineKeyboardButton("Back", callback_data="admin_more_options")]]))
         return
 
-    if data.startswith("view_chat:"):
-        target = data.split(':', 1)[1]
-        info = context.bot_data['users_info'].get(target, {})
-        hist = context.bot_data['histories'].get(target, [])
-        note = context.bot_data['admin_notes'].get(target, "No notes.")
-        if not hist:
-            await query.message.reply_text(f"No chat history for user {target}.", reply_markup=get_admin_panel())
-            return
-        lines = [f"Chat History for {target}: @{info.get('username')} ({info.get('name')})"]
-        lines.append(f"Admin Note: {note}")
-        lines += [f"{m['role']}: {m['content']}" for m in hist[-10:]]
-        await query.message.reply_text('\n'.join(lines), reply_markup=get_chat_view_panel(target))
-        return
-
     if data.startswith("admin_reply_to_user:"):
         target = data.split(':', 1)[1]
         context.user_data['awaiting_admin_reply'] = target
-        await query.message.reply_text("Please enter your reply message:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="view_chat:" + target)]]))
-        return
-
-    if data.startswith("add_note:"):
-        target = data.split(':', 1)[1]
-        context.user_data['awaiting_admin_note'] = target
-        await query.message.reply_text("Please enter the note for the user:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin_more_options")]]))
+        await query.message.reply_text("Please enter your reply message:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin_live_chats")]]))
         return
 
     if data.startswith("view_user:"):
@@ -682,7 +669,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await admin_callback_handler(update, context)
         return
 
-    if data.startswith("admin_") or data.startswith("view_chat:") and (context.user_data.get('awaiting_broadcast') or context.user_data.get('awaiting_notification') or context.user_data.get('awaiting_app_add') or context.user_data.get('awaiting_admin_reply') or context.user_data.get('awaiting_admin_note')):
+    if data in ["admin_back", "admin_back_to_main", "admin_live_chats"] and (context.user_data.get('awaiting_broadcast') or context.user_data.get('awaiting_notification') or context.user_data.get('awaiting_app_add') or context.user_data.get('awaiting_admin_reply') or context.user_data.get('awaiting_admin_note')):
         context.user_data.pop('awaiting_broadcast', None)
         context.user_data.pop('awaiting_notification', None)
         context.user_data.pop('awaiting_app_add', None)
