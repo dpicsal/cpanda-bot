@@ -13,7 +13,7 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes
 )
 from openai import OpenAI, RateLimitError
-import difflib  # Added for fuzzy matching
+import difflib
 
 # Optional RAG dependencies
 try:
@@ -31,7 +31,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_IDS = {641606456}  # Telegram IDs of admins
 BASE_URL = "https://cpanda.app"
 SCRAPE_PATHS = ["/", "/page/payment", "/policy", "/app-plus-subscription-policy"]
-CACHE_TTL = timedelta(minutes=5)  # Reduced for testing
+CACHE_TTL = timedelta(minutes=5)
 EMBED_DIM = 1536
 TOP_K = 3
 
@@ -145,7 +145,7 @@ async def fetch_page_text(path):
     try:
         async with aiohttp.ClientSession() as session:
             resp = await session.get(BASE_URL + path)
-            resp.raise_for_status()  # Ensure request succeeds
+            resp.raise_for_status()
             html = await resp.text()
         soup = BeautifulSoup(html, 'html.parser')
         paras = [p.get_text(strip=True) for p in soup.find_all('p')]
@@ -157,23 +157,25 @@ async def fetch_page_text(path):
     fetch_page_text.cache = cache
     return content
 
-async def scrape_app_list(path):
+async def scrape_app_list(path, force_refresh=False):
     """
     Scrapes the iOS subscriptions page for a list of available apps and their features.
     Returns a list of dictionaries with app names, features, and metadata.
+    force_refresh: If True, bypasses cache and fetches fresh data.
     """
     now = datetime.now(timezone.utc)
     cache = getattr(scrape_app_list, 'cache', {})
-    ts, app_list = cache.get(path, (None, None))
-    if ts and now - ts < CACHE_TTL:
-        logger.info(f"Using cached app list for {path}")
-        return app_list
+    if not force_refresh:
+        ts, app_list = cache.get(path, (None, None))
+        if ts and now - ts < CACHE_TTL:
+            logger.info(f"Using cached app list for {path}")
+            return app_list
 
     app_list = []
     try:
         async with aiohttp.ClientSession() as session:
             resp = await session.get(BASE_URL + path)
-            resp.raise_for_status()  # Ensure request succeeds
+            resp.raise_for_status()
             html = await resp.text()
         soup = BeautifulSoup(html, 'html.parser')
         
@@ -273,12 +275,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         app_query = text
 
     if app_query:
-        app_list = await scrape_app_list('/page/ios-subscriptions')
-        # Use fuzzy matching to find a close match (90% similarity)
-        matching_apps = [
-            app for app in app_list
-            if difflib.SequenceMatcher(None, app_query.lower(), app['name'].lower()).ratio() > 0.9
-        ]
+        app_list = await scrape_app_list('/page/ios-subscriptions', force_refresh=True)  # Force refresh for testing
+        # First try an exact match (case-insensitive)
+        matching_apps = [app for app in app_list if app_query.lower() == app['name'].lower()]
+        if not matching_apps:
+            # If no exact match, use fuzzy matching with a higher threshold
+            matching_apps = [
+                app for app in app_list
+                if difflib.SequenceMatcher(None, app_query.lower(), app['name'].lower()).ratio() > 0.95
+            ]
+            # Log the matching process for debugging
+            match_scores = [
+                (app['name'], difflib.SequenceMatcher(None, app_query.lower(), app['name'].lower()).ratio())
+                for app in app_list
+            ]
+            logger.info(f"App query '{app_query}' match scores: {match_scores}")
+        logger.info(f"App query '{app_query}' matched: {bool(matching_apps)}")
+
         if matching_apps:
             app = matching_apps[0]
             response = f"✅ **{app['name']}** is available on Panda AppStore!\n\nFeatures:\n- " + "\n- ".join(app['features'][:5])
