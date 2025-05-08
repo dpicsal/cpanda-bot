@@ -307,7 +307,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages = [{'role': 'system', 'content': get_system_prompt()}] + system_msgs + recent + user_msgs
 
     try:
-        await update.message.chat.send_action(ChaddAtAction.TYPING)
+        await update.message.chat.send_action(ChatAction.TYPING)
         resp = client.chat.completions.create(model='gpt-4', messages=messages, max_tokens=200)
         reply = resp.choices[0].message.content.strip()
     except RateLimitError:
