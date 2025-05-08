@@ -1,4 +1,3 @@
-```python
 import os
 import logging
 import aiohttp
@@ -308,7 +307,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages = [{'role': 'system', 'content': get_system_prompt()}] + system_msgs + recent + user_msgs
 
     try:
-        await update.message.chat.send_action(ChatAction.TYPING)
+        await update.message.chat.send_action(ChaddAtAction.TYPING)
         resp = client.chat.completions.create(model='gpt-4', messages=messages, max_tokens=200)
         reply = resp.choices[0].message.content.strip()
     except RateLimitError:
@@ -351,4 +350,3 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print('✅ Bot running with memory and RAG...')
     app.run_polling()
-```
