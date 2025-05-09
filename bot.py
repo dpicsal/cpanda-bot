@@ -29,7 +29,7 @@ except ImportError:
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_IDS = {641606456}  # Telegram IDs of admins
+ADMIN_IDS = {641606456}  # Replace with your Telegram ID
 BASE_URL = "https://cpanda.app"
 SCRAPE_PATHS = ["/", "/page/payment", "/policy", "/app-plus-subscription-policy", "/page/ios-subscriptions"]
 CACHE_TTL = timedelta(hours=1)
@@ -40,7 +40,7 @@ TOP_K = 3
 
 logging.basicConfig(
     filename="bot.log",
-    level=logging.DEBUG,  # Changed to DEBUG for detailed AI logging
+    level=logging.DEBUG,  # DEBUG for detailed AI logging
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
@@ -329,12 +329,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages = [{'role': 'system', 'content': get_system_prompt()}] + system_msgs + recent + user_msgs
     logger.debug(f"OpenAI request payload: {messages}")
 
-    # Call ChatGPT for auto-response with retry
+    # Call ChatGPT (based on old script with added retries and error handling)
     reply = None
     for attempt in range(3):
         try:
             await update.message.chat.send_action(ChatAction.TYPING)
-            resp = client.chat.completions.create(model='gpt-4', messages=messages, max_tokens=100)
+            resp = client.chat.completions.create(model='gpt-4', messages=messages, max_tokens=200)
             reply = resp.choices[0].message.content.strip()
             logger.debug(f"OpenAI response: {reply}")
             break
