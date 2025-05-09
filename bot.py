@@ -2,7 +2,7 @@ import os
 import logging
 import aiohttp
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from telegram import (
     Update, ReplyKeyboardMarkup, ReplyKeyboardRemove,
     InlineKeyboardButton, InlineKeyboardMarkup
@@ -114,17 +114,10 @@ def init_bot_data(ctx):
 
 # ----------------------- Keyboards -----------------------
 
-def get_user_menu():
-    return ReplyKeyboardMarkup([
-        ['Plans', 'Support', 'Payment'],
-        ['Policy', 'Sub Policy', 'Help'],
-        ['Subscribe to Updates']
-    ], resize_keyboard=True)
-
 def get_admin_menu():
     return ReplyKeyboardMarkup([
         ['Stats', 'List Users', 'View User'],
-        ['Live Chats'],  # New option for live chat dashboard
+        ['Live Chats'],
         ['Plans', 'Support', 'Payment'],
         ['Policy', 'Sub Policy', 'Help']
     ], resize_keyboard=True)
@@ -135,7 +128,7 @@ REMOVE_MENU = ReplyKeyboardRemove()
 # ----------------------- Scraping Quick Pages -----------------------
 
 async def fetch_page_text(path):
-    now = datetime.utcnow()
+    now = datetime.datetime.now(datetime.UTC)
     cache = getattr(fetch_page_text, 'cache', {})
     ts, content = cache.get(path, (None, None))
     if ts and now - ts < CACHE_TTL:
@@ -168,11 +161,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'timezone': 'UTC+0'  # replace or detect dynamically
     }
     context.user_data['meta'] = user_meta
-    menu = get_admin_menu() if uid in ADMIN_IDS else get_user_menu()
-    await update.message.reply_text(
-        'Welcome to Panda AppStore! How can I assist you today?',
-        reply_markup=menu
-    )
+    if uid in ADMIN_IDS:
+        menu = get_admin_menu()
+        await update.message.reply_text(
+            'Welcome to Panda AppStore Admin! How can I assist you?',
+            reply_markup=menu
+        )
+    else:
+        await update.message.reply_text(
+            'Welcome to Panda AppStore! How can I assist you?\n'
+            'Available commands: Plans, Support, Payment, Policy, Sub Policy, Subscribe to Updates',
+            reply_markup=REMOVE_MENU
+        )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_bot_data(context)
@@ -180,9 +180,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = str(uid)
     text = update.message.text.strip()
 
-    # Handle Back
-    if text == 'Back':
-        menu = get_admin_menu() if uid in ADMIN_IDS else get_user_menu()
+    # Handle Back (admin only)
+    if text == 'Back' and uid in ADMIN_IDS:
+        menu = get_admin_menu()
         await update.message.reply_text('Back to menu.', reply_markup=menu)
         return
 
@@ -195,7 +195,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             context.bot_data['update_subscribers'].add(key)
             reply = 'You are now subscribed to app update notifications!'
-        await update.message.reply_text(reply, reply_markup=get_user_menu())
+        await update.message.reply_text(reply, reply_markup=REMOVE_MENU)
         return
 
     # Admin Live Chats
@@ -225,7 +225,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=target_user,
                 text=f"Admin: {text}",
-                reply_markup=get_user_menu()
+                reply_markup=REMOVE_MENU
             )
             await update.message.reply_text(
                 f"Reply sent to user {target_user}.",
@@ -253,31 +253,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('Select a user:', reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-    # Quick menu commands
+    # Text-based commands for all users
     if text == 'Plans':
         content = await fetch_page_text('/')
-        await update.message.reply_text(content[:4000], reply_markup=BACK_MENU)
+        await update.message.reply_text(content[:4000], reply_markup=REMOVE_MENU)
         return
     if text == 'Support':
-        await update.message.reply_text('Contact: https://cpanda.app/contact', reply_markup=BACK_MENU)
+        await update.message.reply_text('Contact: https://cpanda.app/contact', reply_markup=REMOVE_MENU)
         return
     if text == 'Payment':
         content = await fetch_page_text('/page/payment')
-        await update.message.reply_text(content[:4000], reply_markup=BACK_MENU)
+        await update.message.reply_text(content[:4000], reply_markup=REMOVE_MENU)
         return
     if text == 'Policy':
         content = await fetch_page_text('/policy')
-        await update.message.reply_text(content[:4000], reply_markup=BACK_MENU)
+        await update.message.reply_text(content[:4000], reply_markup=REMOVE_MENU)
         return
     if text == 'Sub Policy':
         content = await fetch_page_text('/app-plus-subscription-policy')
-        await update.message.reply_text(content[:4000], reply_markup=BACK_MENU)
+        await update.message.reply_text(content[:4000], reply_markup=REMOVE_MENU)
         return
 
     # AI auto-response for non-menu user messages
     hist = context.bot_data['histories'].setdefault(key, [])
     hist.append({'role': 'user', 'content': text})
-    context.bot_data['logs'].append({'time': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), 'user': key, 'text': text})
+    context.bot_data['logs'].append({
+        'time': datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d %H:%M:%S'),
+        'user': key,
+        'text': text
+    })
 
     # Notify admins of new user message
     if uid not in ADMIN_IDS:
@@ -325,7 +329,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hist.append({'role': 'assistant', 'content': reply})
 
     # Send AI reply to user
-    await update.message.reply_text(reply, reply_markup=get_user_menu())
+    await update.message.reply_text(reply, reply_markup=REMOVE_MENU)
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
