@@ -3,7 +3,6 @@ import logging
 import aiohttp
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
-from time import sleep
 from telegram import (
     Update, ReplyKeyboardMarkup, ReplyKeyboardRemove,
     InlineKeyboardButton, InlineKeyboardMarkup
@@ -13,7 +12,7 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, ContextTypes
 )
-from openai import OpenAI, RateLimitError, AuthenticationError, OpenAIError
+from openai import OpenAI, RateLimitError
 
 # Optional RAG dependencies
 try:
@@ -182,6 +181,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=REMOVE_MENU
         )
 
+async def test_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Unauthorized.", reply_markup=REMOVE_MENU)
+        return
+    try:
+        resp = client.chat.completions.create(
+            model='gpt-4',
+            messages=[{'role': 'user', 'content': 'Test AI'}],
+            max_tokens=50
+        )
+        await update.message.reply_text(resp.choices[0].message.content.strip())
+    except Exception as e:
+        await update.message.reply_text(f"Test failed: {e}")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     init_bot_data(context)
     uid = update.effective_user.id
@@ -329,35 +342,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages = [{'role': 'system', 'content': get_system_prompt()}] + system_msgs + recent + user_msgs
     logger.debug(f"OpenAI request payload: {messages}")
 
-    # Call ChatGPT (based on old script with added retries and error handling)
-    reply = None
-    for attempt in range(3):
+    # Call ChatGPT (based on old script)
+    try:
+        await update.message.chat.send_action(ChatAction.TYPING)
+        resp = client.chat.completions.create(model='gpt-4', messages=messages, max_tokens=200)
+        reply = resp.choices[0].message.content.strip()
+        logger.debug(f"OpenAI response: {reply}")
+    except RateLimitError:
+        logger.warning("Rate limit hit, retrying in 10 seconds")
+        sleep(10)
         try:
-            await update.message.chat.send_action(ChatAction.TYPING)
             resp = client.chat.completions.create(model='gpt-4', messages=messages, max_tokens=200)
             reply = resp.choices[0].message.content.strip()
-            logger.debug(f"OpenAI response: {reply}")
-            break
-        except RateLimitError as e:
-            logger.warning(f"Rate limit hit, retrying in 10 seconds (attempt {attempt + 1}/3): {e}")
-            sleep(10)
-        except AuthenticationError as e:
-            logger.error(f"OpenAI authentication error: {e}. Check OPENAI_API_KEY.")
-            reply = '⚠️ Bot configuration error—please try again later.'
-            break
-        except OpenAIError as e:
-            logger.error(f"OpenAI error: {e}")
-            if attempt == 2:
-                reply = '⚠️ Unable to process your request—please try again later.'
-            sleep(2)
+            logger.debug(f"OpenAI retry response: {reply}")
         except Exception as e:
-            logger.error(f"Unexpected error in OpenAI call: {e}")
-            if attempt == 2:
-                reply = '⚠️ Something went wrong—please try again later.'
-            sleep(2)
-    if not reply:
-        reply = '⚠️ Unable to process your request—please try again later.'
-        logger.error("All OpenAI retries failed.")
+            logger.error(f"Retry failed: {e}")
+            reply = '😅 Rate limited—please try again soon.'
+    except Exception as e:
+        logger.error(f"Chat error: {e}")
+        reply = '⚠️ Something went wrong—please try again later.'
 
     # Save AI reply
     hist.append({'role': 'assistant', 'content': reply})
@@ -419,6 +422,7 @@ if __name__ == '__main__':
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('testai', test_ai))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print('✅ Bot running with memory, RAG, and live chat dashboard...')
