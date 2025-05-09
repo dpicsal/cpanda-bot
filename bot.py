@@ -3,6 +3,7 @@ import logging
 import aiohttp
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
+from time import sleep
 from telegram import (
     Update, ReplyKeyboardMarkup, ReplyKeyboardRemove,
     InlineKeyboardButton, InlineKeyboardMarkup
@@ -46,6 +47,8 @@ logger = logging.getLogger(__name__)
 
 # ----------------------- OpenAI Client -----------------------
 
+if not OPENAI_API_KEY:
+    logger.error("OPENAI_API_KEY is not set.")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # System prompt
@@ -60,9 +63,13 @@ def get_system_prompt():
 def get_embedding(text: str):
     if not RAG_ENABLED:
         return None
-    res = client.embeddings.create(input=[text], model="text-embedding-ada-002")
-    embedding = res.data[0].embedding if hasattr(res, 'data') else res['data'][0]['embedding']
-    return np.array(embedding, dtype=np.float32)
+    try:
+        res = client.embeddings.create(input=[text], model="text-embedding-ada-002")
+        embedding = res.data[0].embedding if hasattr(res, 'data') else res['data'][0]['embedding']
+        return np.array(embedding, dtype=np.float32)
+    except Exception as e:
+        logger.error(f"Embedding error: {e}")
+        return None
 
 documents = []
 index = None
@@ -96,10 +103,13 @@ async def scrape_and_build_index():
             if parts:
                 documents.append({'text': '\n'.join(parts), 'path': path, 'heading': heading})
     if documents:
-        embs = np.vstack([get_embedding(d['text']) for d in documents])
-        index = faiss.IndexFlatL2(EMBED_DIM)
-        index.add(embs)
-        logger.info(f"Built FAISS index with {len(documents)} documents.")
+        embs = np.vstack([get_embedding(d['text']) for d in documents if get_embedding(d['text']) is not None])
+        if embs.size > 0:
+            index = faiss.IndexFlatL2(EMBED_DIM)
+            index.add(embs)
+            logger.info(f"Built FAISS index with {len(documents)} documents.")
+        else:
+            logger.warning("No valid embeddings for FAISS index.")
 
 # ----------------------- Bot Data Initialization -----------------------
 
@@ -110,7 +120,6 @@ def init_bot_data(ctx):
     d.setdefault('last_time', {})
     d.setdefault('banned', set())
     d.setdefault('users_info', {})
-    d.setdefault('update_subscribers', set())  # For app update subscriptions
 
 # ----------------------- Keyboards -----------------------
 
@@ -169,8 +178,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(
-            'Welcome to Panda AppStore! How can I assist you?\n'
-            'Available commands: Plans, Support, Payment, Policy, Sub Policy, Subscribe to Updates',
+            'Welcome to Panda AppStore! How can I assist you?',
             reply_markup=REMOVE_MENU
         )
 
@@ -184,18 +192,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == 'Back' and uid in ADMIN_IDS:
         menu = get_admin_menu()
         await update.message.reply_text('Back to menu.', reply_markup=menu)
-        return
-
-    # Handle Subscribe to Updates
-    if text == 'Subscribe to Updates':
-        context.bot_data.setdefault('update_subscribers', set())
-        if key in context.bot_data['update_subscribers']:
-            context.bot_data['update_subscribers'].remove(key)
-            reply = 'You have unsubscribed from app update notifications.'
-        else:
-            context.bot_data['update_subscribers'].add(key)
-            reply = 'You are now subscribed to app update notifications!'
-        await update.message.reply_text(reply, reply_markup=REMOVE_MENU)
         return
 
     # Admin Live Chats
@@ -224,7 +220,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=target_user,
-                text=f"Admin: {text}",
+                text=text,
                 reply_markup=REMOVE_MENU
             )
             await update.message.reply_text(
@@ -233,7 +229,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             # Log admin reply in user history
             hist = context.bot_data['histories'].setdefault(target_user, [])
-            hist.append({'role': 'assistant', 'content': f"Admin: {text}"})
+            hist.append({'role': 'assistant', 'content': text})
         except Exception as e:
             logger.error(f"Reply to {target_user} failed: {e}")
             await update.message.reply_text(
@@ -253,28 +249,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('Select a user:', reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-    # Text-based commands for all users
-    if text == 'Plans':
-        content = await fetch_page_text('/')
-        await update.message.reply_text(content[:4000], reply_markup=REMOVE_MENU)
-        return
-    if text == 'Support':
-        await update.message.reply_text('Contact: https://cpanda.app/contact', reply_markup=REMOVE_MENU)
-        return
-    if text == 'Payment':
-        content = await fetch_page_text('/page/payment')
-        await update.message.reply_text(content[:4000], reply_markup=REMOVE_MENU)
-        return
-    if text == 'Policy':
-        content = await fetch_page_text('/policy')
-        await update.message.reply_text(content[:4000], reply_markup=REMOVE_MENU)
-        return
-    if text == 'Sub Policy':
-        content = await fetch_page_text('/app-plus-subscription-policy')
-        await update.message.reply_text(content[:4000], reply_markup=REMOVE_MENU)
-        return
+    # Admin-only commands
+    if uid in ADMIN_IDS:
+        if text == 'Stats':
+            users = len(context.bot_data['users_info'])
+            messages = sum(len(h) for h in context.bot_data['histories'].values())
+            await update.message.reply_text(
+                f"Stats:\nUsers: {users}\nMessages: {messages}",
+                reply_markup=get_admin_menu()
+            )
+            return
+        if text == 'List Users':
+            users = context.bot_data['users_info']
+            if not users:
+                await update.message.reply_text('No users found.', reply_markup=get_admin_menu())
+                return
+            lines = [f"{u}: @{info['username']}" for u, info in users.items()]
+            await update.message.reply_text('\n'.join(lines), reply_markup=get_admin_menu())
+            return
+        if text in ['Plans', 'Support', 'Payment', 'Policy', 'Sub Policy', 'Help']:
+            paths = {
+                'Plans': '/',
+                'Support': '/contact',
+                'Payment': '/page/payment',
+                'Policy': '/policy',
+                'Sub Policy': '/app-plus-subscription-policy',
+                'Help': '/help'
+            }
+            if text == 'Support':
+                await update.message.reply_text(
+                    'Contact: https://cpanda.app/contact',
+                    reply_markup=get_admin_menu()
+                )
+            else:
+                content = await fetch_page_text(paths[text])
+                await update.message.reply_text(content[:4000], reply_markup=get_admin_menu())
+            return
 
-    # AI auto-response for non-menu user messages
+    # AI auto-response for all user messages
     hist = context.bot_data['histories'].setdefault(key, [])
     hist.append({'role': 'user', 'content': text})
     context.bot_data['logs'].append({
@@ -305,25 +317,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if RAG_ENABLED and index is not None:
         q_emb = get_embedding(text)
-        _, ids = index.search(np.array([q_emb]), TOP_K)
-        for i in ids[0]:
-            doc = documents[i]
-            system_msgs.append({'role': 'system', 'content': f"[{doc['path']} - {doc['heading']}]: {doc['text']}"})
+        if q_emb is not None:
+            _, ids = index.search(np.array([q_emb]), TOP_K)
+            for i in ids[0]:
+                doc = documents[i]
+                system_msgs.append({'role': 'system', 'content': f"[{doc['path']} - {doc['heading']}]: {doc['text']}"})
 
     user_msgs = [{'role': 'user', 'content': text}]
     recent = hist[-5:]
     messages = [{'role': 'system', 'content': get_system_prompt()}] + system_msgs + recent + user_msgs
 
-    # Call ChatGPT for auto-response
-    try:
-        await update.message.chat.send_action(ChatAction.TYPING)
-        resp = client.chat.completions.create(model='gpt-4', messages=messages, max_tokens=200)
-        reply = resp.choices[0].message.content.strip()
-    except RateLimitError:
-        reply = '😅 Rate limited—please try again soon.'
-    except Exception as e:
-        logger.error(f"Chat error: {e}")
-        reply = '⚠️ Something went wrong—please try again later.'
+    # Call ChatGPT for auto-response with retry
+    reply = None
+    for attempt in range(3):
+        try:
+            await update.message.chat.send_action(ChatAction.TYPING)
+            resp = client.chat.completions.create(model='gpt-4', messages=messages, max_tokens=200)
+            reply = resp.choices[0].message.content.strip()
+            break
+        except RateLimitError:
+            logger.warning(f"Rate limit hit, retrying in 10 seconds (attempt {attempt + 1}/3)")
+            sleep(10)
+        except Exception as e:
+            logger.error(f"Chat error: {e}")
+            if attempt == 2:
+                reply = '⚠️ Something went wrong—please try again later.'
+            sleep(2)
+    if not reply:
+        reply = '⚠️ Unable to process your request—please try again later.'
 
     # Save AI reply
     hist.append({'role': 'assistant', 'content': reply})
