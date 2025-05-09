@@ -1,4 +1,3 @@
-```python
 import os
 import logging
 import aiohttp
@@ -386,4 +385,3 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print('✅ Bot running with memory, RAG, and live chat dashboard...')
     app.run_polling()
-```
