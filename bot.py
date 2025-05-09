@@ -13,7 +13,7 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, ContextTypes
 )
-from openai import OpenAI, RateLimitError
+from openai import OpenAI, RateLimitError, AuthenticationError, OpenAIError
 
 # Optional RAG dependencies
 try:
@@ -40,7 +40,7 @@ TOP_K = 3
 
 logging.basicConfig(
     filename="bot.log",
-    level=logging.INFO,
+    level=logging.DEBUG,  # Changed to DEBUG for detailed AI logging
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 # ----------------------- OpenAI Client -----------------------
 
 if not OPENAI_API_KEY:
-    logger.error("OPENAI_API_KEY is not set.")
+    logger.error("OPENAI_API_KEY is not set. AI responses will fail.")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # System prompt
@@ -187,6 +187,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     key = str(uid)
     text = update.message.text.strip()
+    logger.debug(f"Received message from user {key}: {text}")
 
     # Handle Back (admin only)
     if text == 'Back' and uid in ADMIN_IDS:
@@ -326,25 +327,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_msgs = [{'role': 'user', 'content': text}]
     recent = hist[-5:]
     messages = [{'role': 'system', 'content': get_system_prompt()}] + system_msgs + recent + user_msgs
+    logger.debug(f"OpenAI request payload: {messages}")
 
     # Call ChatGPT for auto-response with retry
     reply = None
     for attempt in range(3):
         try:
             await update.message.chat.send_action(ChatAction.TYPING)
-            resp = client.chat.completions.create(model='gpt-4', messages=messages, max_tokens=200)
+            resp = client.chat.completions.create(model='gpt-4', messages=messages, max_tokens=100)
             reply = resp.choices[0].message.content.strip()
+            logger.debug(f"OpenAI response: {reply}")
             break
-        except RateLimitError:
-            logger.warning(f"Rate limit hit, retrying in 10 seconds (attempt {attempt + 1}/3)")
+        except RateLimitError as e:
+            logger.warning(f"Rate limit hit, retrying in 10 seconds (attempt {attempt + 1}/3): {e}")
             sleep(10)
+        except AuthenticationError as e:
+            logger.error(f"OpenAI authentication error: {e}. Check OPENAI_API_KEY.")
+            reply = '⚠️ Bot configuration error—please try again later.'
+            break
+        except OpenAIError as e:
+            logger.error(f"OpenAI error: {e}")
+            if attempt == 2:
+                reply = '⚠️ Unable to process your request—please try again later.'
+            sleep(2)
         except Exception as e:
-            logger.error(f"Chat error: {e}")
+            logger.error(f"Unexpected error in OpenAI call: {e}")
             if attempt == 2:
                 reply = '⚠️ Something went wrong—please try again later.'
             sleep(2)
     if not reply:
         reply = '⚠️ Unable to process your request—please try again later.'
+        logger.error("All OpenAI retries failed.")
 
     # Save AI reply
     hist.append({'role': 'assistant', 'content': reply})
