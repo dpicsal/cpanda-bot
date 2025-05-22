@@ -6,4 +6,3 @@ numpy==1.24.3
 faiss-cpu==1.7.4
 python-dotenv==1.0.1
 playwright==1.48.0
-upgrade pip setuptools wheel
