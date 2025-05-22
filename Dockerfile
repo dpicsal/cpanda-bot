@@ -1,25 +1,30 @@
-FROM python:3.12-slim
+FROM python:3.10-slim
 
-# Install system dependencies for pip and packages with C extensions
-RUN apt-get update && apt-get install -y --no-install-recommends \
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Install all required system packages including swig for faiss-cpu
+RUN apt-get update && apt-get install -y \
     gcc \
-    build-essential \
-    python3-dev \
     libffi-dev \
     libssl-dev \
+    python3-dev \
+    build-essential \
+    swig \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Set working directory
 WORKDIR /app
-COPY . /app
 
-# Upgrade pip and install setuptools/wheel for PEP517 builds
-RUN pip install --upgrade pip setuptools wheel
+# Copy all project files
+COPY . .
 
-# Install Python dependencies
-RUN pip install -r requirements.txt
+# Upgrade pip and install build support
+RUN pip install --upgrade pip setuptools wheel build
 
-# (Optional) If you use playwright, install browsers
-RUN python -m playwright install --with-deps
+# Install project dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
+# Start the bot
 CMD ["python", "bot.py"]
