@@ -1,1 +1,8 @@
-
+    {
+      "premium": {
+        "name": "Premium",
+        "price_stars": 2500,
+        "price_usd": 40,
+        "codes_file": "codes_premium.txt"
+      }
+    }
