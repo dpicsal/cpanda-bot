@@ -17,6 +17,7 @@ import time
 from typing import Dict, Set, Optional
 import random
 from asyncio import create_task, CancelledError
+import html
 
 # === Load environment ===
 load_dotenv()
@@ -408,14 +409,14 @@ async def show_user_details(update, context, uid):
     )
 
 async def show_broadcast_menu(update, context):
-    keyboard = []
-    keyboard.append(back_button('admin_main'))
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='admin_main')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.edit_message_text(
-        "<b>📢 Broadcast</b>\n<i>──────────────</i>\nFeature coming soon.",
+        "<b>📢 Broadcast</b>\n<i>──────────────</i>\nPlease send the message you want to broadcast to all users.",
         reply_markup=reply_markup,
         parse_mode='HTML'
     )
+    context.user_data['admin_action'] = 'broadcast'
 
 async def show_stats_menu(update, context):
     users_info = context.bot_data.get('users_info', {})
@@ -448,6 +449,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "username": update.effective_user.username,
         "name": update.effective_user.full_name
     }
+    save_users_info(context.bot_data["users_info"])
     # Promotional welcome message
     promo_msg = (
         "🎉 Welcome to <b>Panda AppStore</b>!\n"
@@ -541,16 +543,35 @@ async def handle_admin_action_input(update: Update, context: ContextTypes.DEFAUL
         return
     elif action == 'broadcast':
         users_info = context.bot_data.get('users_info', {})
+        # Always send to admin's own user ID for testing
+        admin_id = str(update.effective_user.id)
+        all_user_ids = set(users_info.keys()) | {admin_id}
+        print("Broadcasting to user IDs:", list(all_user_ids))
+        logger.info(f"Broadcasting to user IDs: {list(all_user_ids)}")
         count = 0
-        for uid in users_info:
+        failed = 0
+        failed_details = []
+        brand_header = "🐼 <b>Panda AppStore Broadcast</b>\n<i>──────────────</i>\n"
+        brand_footer = "\n\n<i>Thank you for being with Panda AppStore!</i>"
+        for uid in all_user_ids:
             try:
-                await context.bot.send_message(chat_id=int(uid), text=user_input)
+                broadcast_message = f"{brand_header}{user_input}{brand_footer}"
+                await context.bot.send_message(chat_id=int(uid), text=broadcast_message, parse_mode='HTML')
                 count += 1
+                import asyncio
+                await asyncio.sleep(0.05)  # Rate limit to avoid Telegram flood
             except Exception as e:
                 logger.error(f"[BROADCAST ERROR] Could not send to {uid}: {e}")
-        await update.message.reply_text(f"✅ Broadcast sent to {count} users.")
+                print(f"[BROADCAST ERROR] Could not send to {uid}: {e}")
+                failed += 1
+                failed_details.append(f"{uid}: {e}")
+        summary = f"✅ Broadcast sent to <b>{count}</b> users."
+        if failed:
+            summary += f"\n❌ Failed to send to <b>{failed}</b> users:"
+            summary += "\n" + "\n".join(failed_details)
+        await update.message.reply_text(summary, parse_mode='HTML')
         context.user_data['admin_action'] = None
-        # Optionally, return to main menu
+        # Return to admin panel
         class DummyCallback:
             def __init__(self, message):
                 self.callback_query = type('obj', (object,), {'edit_message_text': message.edit_text})
@@ -1221,14 +1242,14 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text("Please enter the user ID or username to remove a subscription:")
         await query.answer()
     elif data == 'admin_view_files':
-        import os
         try:
             cwd = os.getcwd()
             files = os.listdir('.')
             file_list = '\n'.join(files)
+            escaped_file_list = html.escape(file_list)
             await query.edit_message_text(
                 f"<b>Current working directory:</b> {cwd}\n"
-                f"<b>Bot Directory Files:</b>\n<pre>{file_list}</pre>",
+                f"<b>Bot Directory Files:</b>\n<pre>{escaped_file_list}</pre>",
                 parse_mode='HTML'
             )
         except Exception as e:
@@ -1457,8 +1478,23 @@ def ensure_required_files():
 # Call this at the top after loading environment
 ensure_required_files()
 
+def load_users_info():
+    if os.path.exists("users_info.json"):
+        with open("users_info.json", "r") as f:
+            return json.load(f)
+    return {}
+
+def save_users_info(users_info):
+    with open("users_info.json", "w") as f:
+        json.dump(users_info, f, indent=2)
+
+# Load users_info at startup
+users_info_loaded = load_users_info()
+
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    # Assign loaded users_info to bot_data
+    app.bot_data["users_info"] = users_info_loaded
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("threads", list_threads))
     # Admin text input handler (must be before generic text handler)
