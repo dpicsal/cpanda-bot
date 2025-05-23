@@ -233,6 +233,7 @@ def pagination_buttons(page, total, callback_prefix):
 
 async def show_admin_panel(update, context):
     keyboard = [
+        [InlineKeyboardButton("🔄 Update Website Data", callback_data='admin_update_website_data')],
         [InlineKeyboardButton("🗂️ Manage Plans", callback_data='admin_plans'),
          InlineKeyboardButton("👤 Manage Subscriptions", callback_data='admin_subs'),
          InlineKeyboardButton("💸 Set Price", callback_data='admin_set_price')],
@@ -1221,12 +1222,36 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer()
     elif data == 'admin_view_files':
         import os
-        files = os.listdir('.')
-        file_list = '\n'.join(files)
-        await query.message.reply_text(
-            f"<b>Bot Directory Files:</b>\n<pre>{file_list}</pre>",
-            parse_mode='HTML'
+        try:
+            cwd = os.getcwd()
+            files = os.listdir('.')
+            file_list = '\n'.join(files)
+            await query.edit_message_text(
+                f"<b>Current working directory:</b> {cwd}\n"
+                f"<b>Bot Directory Files:</b>\n<pre>{file_list}</pre>",
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ Could not list files: {e}")
+        await query.answer()
+    elif data == 'admin_update_website_data':
+        # Show confirmation prompt
+        confirm_keyboard = [
+            [InlineKeyboardButton("✅ Yes, update", callback_data='admin_confirm_update_website_data')],
+            [InlineKeyboardButton("⬅️ Back", callback_data='admin_main')]
+        ]
+        await query.edit_message_text(
+            "Are you sure you want to update website data from cpanda.app?",
+            reply_markup=InlineKeyboardMarkup(confirm_keyboard)
         )
+        await query.answer()
+    elif data == 'admin_confirm_update_website_data':
+        import subprocess
+        try:
+            subprocess.run(['python', 'cpanda_crawler.py'], check=True)
+            await query.message.reply_text("✅ Website data updated from cpanda.app!")
+        except Exception as e:
+            await query.message.reply_text(f"❌ Failed to update website data: {e}")
         await query.answer()
 
 # === Rate Limiting ===
@@ -1408,6 +1433,30 @@ def save_subscription_price(price):
     with open(SUBSCRIPTION_PRICE_FILE, "w") as f:
         f.write(str(price))
 
+def ensure_required_files():
+    required_files = {
+        "active_threads.json": {},
+        "codes_test.txt": "",
+        "conversation_history.json": {},
+        "cpanda_pages.txt": "",
+        "plans.json": {},
+        "redeem_codes_premium.txt": "",
+        "redeem_codes.txt": "",
+        "subscription_price.txt": "2500",  # Default price
+        "user_sessions.json": {},
+    }
+    for filename, default_content in required_files.items():
+        if not os.path.exists(filename):
+            with open(filename, "w") as f:
+                if filename.endswith('.json'):
+                    import json
+                    json.dump(default_content, f, indent=2)
+                else:
+                    f.write(str(default_content))
+
+# Call this at the top after loading environment
+ensure_required_files()
+
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -1419,7 +1468,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     # Admin panel: all admin callback_data starts with these
     app.add_handler(CallbackQueryHandler(admin_callback_handler,
-        pattern=r"^(admin_.*|plan_.*|add_plan|add_codes_.*|view_codes_.*|remove_code_.*|remove_plan_.*|add_redeem_codes.*|add_sub.*|remove_sub.*|view_redeem_codes.*|remove_redeem_code.*|users_page_.*|user_details_.*|admin_broadcast.*|admin_stats.*|admin_set_price.*)$"))
+        pattern=r"^(admin_.*|plan_.*|add_plan|add_codes_.*|view_codes_.*|remove_code_.*|remove_plan_.*|add_redeem_codes.*|add_sub.*|remove_sub.*|view_redeem_codes.*|remove_redeem_code.*|users_page_.*|user_details_.*|admin_broadcast.*|admin_stats.*|admin_set_price.*|admin_update_website_data)$"))
 
     # User panel
     app.add_handler(CallbackQueryHandler(user_callback_handler,
