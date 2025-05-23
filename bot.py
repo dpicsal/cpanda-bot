@@ -6,7 +6,7 @@ import openai
 from datetime import datetime, timedelta, time as datetime_time
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, LabeledPrice, ReplyKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, LabeledPrice, ReplyKeyboardMarkup, KeyboardButton
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -124,30 +124,9 @@ async def call_chatgpt(messages, max_tokens=200, retries=3, backoff=10):
 
 def get_system_prompt():
     return (
-        "You are a friendly, expert sales and support agent for cpanda.app, specializing in the Premium Plan ($40/year). "
-        "Always answer questions about features, pricing, benefits, and terms in detail, and help users choose and buy the right plan. "
-        "Be casual, warm, and helpful—never say you're an AI or chatbot.\n\n"
-        "If a user asks about the availability of a specific app (for example, CarX Street, PUBG, WhatsApp mods, etc.), "
-        "do NOT confirm or deny the availability directly. "
-        "Instead, always direct the user to the official, up-to-date list of available apps at: "
-        "https://cpanda.app/page/ios-subscriptions. "
-        "Say something like: 'You can find the full and most up-to-date list of available apps here: https://cpanda.app/page/ios-subscriptions'. "
-        "Do not say 'yes' or 'no' about any specific app. "
-        "Be warm, helpful, and clear in your responses.\n\n"
-        "Premium Plan Key Points:\n"
-        "• One subscription for one iOS device (iPhone or iPad), non-transferable, linked to the device's UDID.\n"
-        "• $40 one-time payment for one year of access. No auto-renewal; users must purchase again after expiry.\n"
-        "• Access premium & modded apps, ad-free experience, exclusive perks, and priority support.\n"
-        "• Hassle-free installation: no PC or jailbreak required, install directly, duplicate apps for multiple accounts, install via direct links or IPA files.\n"
-        "• Built-in downloaders for social media, regular updates, and a 3-month revoke guarantee (you can request re-activation within 3 months of purchase).\n"
-        "• Use the plan only for lawful purposes and keep account/device info secure.\n"
-        "• All personal data is processed according to the Panda AppStore Privacy Policy (see website for details).\n"
-        "• Panda AppStore may suspend or terminate access if terms are violated or for unlawful activity.\n"
-        "• Priority support is available, but no guaranteed response time.\n"
-        "• For more details, see the full Terms and Conditions on the website.\n\n"
-        "If a user asks about the Premium Plan, highlight these benefits and terms. If they ask about refunds, revocation, device compatibility, or privacy, answer using the details above. "
-        "If you don't know the answer, politely suggest they contact human support. "
-        "Website: https://www.cpanda.app"
+        "🎉 Welcome to <b>Panda AppStore</b>! "
+        "Unlock a world of premium and modded iOS apps, hassle-free installation, and exclusive features.\n\n"
+        "Need help choosing a plan or have a question? I'm here for you!"
     )
 
 def init_bot_data(ctx):
@@ -188,8 +167,7 @@ async def get_or_create_thread(context, user_id, username):
     # Get user's display name: full name > username > user_id
     user_info = context.bot_data.get('users_info', {}).get(str(user_id), {})
     name = user_info.get('name')
-    uname = user_info.get('username')
-    display_name = name or uname or "Customer"
+    display_name = name if name else "Customer"
     lang = user_info.get('language_code', 'unknown')
     flag = ''
     if lang == 'hu':
@@ -198,7 +176,7 @@ async def get_or_create_thread(context, user_id, username):
         print(f"DEBUG: Creating new thread for user {user_id} with name {display_name}")
         thread = await context.bot.create_forum_topic(
             chat_id=GROUP_ID,
-            name=display_name  # Only display name, no user ID
+            name=display_name  # Only name, no username or user ID
         )
         thread_id = thread.message_thread_id
         active_threads[str(user_id)] = int(thread_id)
@@ -245,9 +223,6 @@ async def is_admin_active(context, thread_id):
 def back_button(callback_data):
     return [InlineKeyboardButton("⬅️ Back", callback_data=callback_data)]
 
-def home_button():
-    return [InlineKeyboardButton("🏠 Home", callback_data="admin_main")]
-
 def pagination_buttons(page, total, callback_prefix):
     buttons = []
     if page > 0:
@@ -264,7 +239,8 @@ async def show_admin_panel(update, context):
         [InlineKeyboardButton("🎟️ Redeem Codes", callback_data='admin_redeem'),
          InlineKeyboardButton("👥 Users", callback_data='admin_users')],
         [InlineKeyboardButton("📢 Broadcast", callback_data='admin_broadcast'),
-         InlineKeyboardButton("📊 Stats", callback_data='admin_stats')]
+         InlineKeyboardButton("📊 Stats", callback_data='admin_stats')],
+        [InlineKeyboardButton("📁 View Bot Files", callback_data='admin_view_files')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     text = (
@@ -284,7 +260,6 @@ async def show_plans_menu(update, context):
         for key, plan in plans.items()
     ]
     keyboard.append([InlineKeyboardButton("➕ Add Plan", callback_data="add_plan")])
-    keyboard.append(home_button())
     keyboard.append(back_button("admin_main"))
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.edit_message_text(
@@ -308,7 +283,6 @@ async def show_plan_detail_menu(update, context, plan_key):
         [InlineKeyboardButton("❌ Remove Code", callback_data=f"remove_code_{plan_key}")],
         [InlineKeyboardButton("❌ Remove Plan", callback_data=f"remove_plan_{plan_key}")]
     ]
-    keyboard.append(home_button())
     keyboard.append(back_button("admin_plans"))
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.edit_message_text(
@@ -322,7 +296,6 @@ async def show_subs_menu(update, context):
         [InlineKeyboardButton("➕ Add Subscription", callback_data='add_sub'),
          InlineKeyboardButton("➖ Remove Subscription", callback_data='remove_sub')]
     ]
-    keyboard.append(home_button())
     keyboard.append(back_button("admin_main"))
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.edit_message_text(
@@ -337,7 +310,6 @@ async def show_redeem_menu(update, context):
         [InlineKeyboardButton("📄 View Codes", callback_data='view_redeem_codes')],
         [InlineKeyboardButton("❌ Remove Code", callback_data='remove_redeem_code')]
     ]
-    keyboard.append(home_button())
     keyboard.append(back_button("admin_main"))
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.edit_message_text(
@@ -358,7 +330,6 @@ async def show_codes_page(update, context, page=0, per_page=10):
     keyboard = []
     if nav:
         keyboard.append(nav)
-    keyboard.append(home_button())
     keyboard.append(back_button('admin_redeem'))
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.edit_message_text(
@@ -409,7 +380,6 @@ async def show_users_page(update, context, page=0, per_page=10):
     nav = pagination_buttons(page, total, "users_page")
     if nav:
         keyboard.append(nav)
-    keyboard.append(home_button())
     keyboard.append(back_button('admin_main'))
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.edit_message_text(
@@ -428,7 +398,6 @@ async def show_user_details(update, context, uid):
         f"Username: @{info.get('username', '-') or '-'}\n"
     )
     keyboard = []
-    keyboard.append(home_button())
     keyboard.append(back_button('admin_users'))
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.edit_message_text(
@@ -439,7 +408,6 @@ async def show_user_details(update, context, uid):
 
 async def show_broadcast_menu(update, context):
     keyboard = []
-    keyboard.append(home_button())
     keyboard.append(back_button('admin_main'))
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.edit_message_text(
@@ -464,7 +432,6 @@ async def show_stats_menu(update, context):
         f"💸 Current subscription price: <b>{price} Stars</b> (≈ ${approx_usd})"
     )
     keyboard = []
-    keyboard.append(home_button())
     keyboard.append(back_button('admin_main'))
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.callback_query.edit_message_text(
@@ -480,27 +447,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "username": update.effective_user.username,
         "name": update.effective_user.full_name
     }
-    # Friendly welcome message
-    welcome_text = (
-        "<b>🐼 Welcome to Panda AppStore!</b>\n\n"
-        "Your one-stop shop for premium & modded iOS apps, priority support, and exclusive perks.\n\n"
-        "<b>How to get started:</b>\n"
-        "• Browse available plans below\n"
-        "• Tap <b>Buy Now</b> to pay instantly with Telegram Stars\n"
-        "• Or just ask a question and our support team will help you!\n\n"
-        "<i>To begin, choose a plan or tap 🛒 Buy Now below.</i>"
+    # Promotional welcome message
+    promo_msg = (
+        "🎉 Welcome to <b>Panda AppStore</b>!\n"
+        "Unlock a world of premium and modded iOS apps, hassle-free installation, and exclusive features.\n\n"
+        "Need help choosing a plan or have a question? I'm here for you!"
     )
     if uid in ADMIN_IDS and update.effective_chat.type == 'private':
         await update.message.reply_text(
-            welcome_text + "\n\n<b>Admin access detected. Loading admin panel...</b>",
+            promo_msg + "\n\n<b>Admin access detected. Loading admin panel...</b>",
             parse_mode='HTML',
             reply_markup=ReplyKeyboardRemove()
         )
         await show_admin_panel(update, context)
         return
     await update.message.reply_text(
-        welcome_text,
-        parse_mode='HTML'
+        promo_msg,
+        parse_mode='HTML',
+        reply_markup=ReplyKeyboardRemove()
     )
     await show_user_panel(update, context)
 
@@ -1106,6 +1070,14 @@ async def user_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     logger.info(f"[DEBUG] user_callback_handler called with data: {data}")  # Added logging
     if data == 'user_panel' or data.lower() == 'back' or data == '🔙 Back':
         await show_user_panel(update, context)
+    elif data == 'buy_now':
+        # Use the first plan as default when Buy Now is clicked
+        plans = load_plans()
+        if not plans:
+            await query.answer("No plans available.")
+            return
+        first_key = next(iter(plans))
+        await handle_user_payment(update, context, first_key, 'stars')
     elif data.startswith('buy_'):
         plan_key = data.split('_', 1)[1]
         await handle_user_buy_plan(update, context, plan_key)
@@ -1246,6 +1218,15 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     elif data == 'remove_sub':
         context.user_data['admin_action'] = 'remove_sub'
         await query.message.reply_text("Please enter the user ID or username to remove a subscription:")
+        await query.answer()
+    elif data == 'admin_view_files':
+        import os
+        files = os.listdir('.')
+        file_list = '\n'.join(files)
+        await query.message.reply_text(
+            f"<b>Bot Directory Files:</b>\n<pre>{file_list}</pre>",
+            parse_mode='HTML'
+        )
         await query.answer()
 
 # === Rate Limiting ===
@@ -1438,7 +1419,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     # Admin panel: all admin callback_data starts with these
     app.add_handler(CallbackQueryHandler(admin_callback_handler,
-        pattern=r"^(admin_.*|plan_.*|add_codes_.*|view_codes_.*|remove_code_.*|remove_plan_.*|add_redeem_codes.*|add_sub.*|remove_sub.*|view_redeem_codes.*|remove_redeem_code.*|users_page_.*|user_details_.*|admin_broadcast.*|admin_stats.*|admin_set_price.*)$"))
+        pattern=r"^(admin_.*|plan_.*|add_plan|add_codes_.*|view_codes_.*|remove_code_.*|remove_plan_.*|add_redeem_codes.*|add_sub.*|remove_sub.*|view_redeem_codes.*|remove_redeem_code.*|users_page_.*|user_details_.*|admin_broadcast.*|admin_stats.*|admin_set_price.*)$"))
 
     # User panel
     app.add_handler(CallbackQueryHandler(user_callback_handler,
