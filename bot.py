@@ -1570,7 +1570,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     # Admin panel: all admin callback_data starts with these
     app.add_handler(CallbackQueryHandler(admin_callback_handler,
-        pattern=r"^(admin_.*|plan_.*|add_plan|add_codes_.*|view_codes_.*|remove_code_.*|remove_plan_.*|add_redeem_codes.*|add_sub.*|remove_sub.*|view_redeem_codes.*|remove_redeem_code.*|users_page_.*|user_details_.*|admin_broadcast.*|admin_stats.*|admin_set_price.*|admin_update_website_data|admin_view_files)$"))
+        pattern=r"^(admin_.*|plan_.*|add_plan|add_codes_.*|view_codes_.*|remove_code_.*|remove_plan_.*|confirm_remove_plan_.*|add_redeem_codes.*|add_sub.*|remove_sub.*|view_redeem_codes.*|remove_redeem_code.*|users_page_.*|user_details_.*|admin_broadcast.*|admin_stats.*|admin_set_price.*|admin_update_website_data|admin_view_files)$"))
 
     # User panel
     app.add_handler(CallbackQueryHandler(user_callback_handler,
