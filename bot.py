@@ -113,9 +113,12 @@ async def call_chatgpt(messages, max_tokens=200, retries=3, backoff=10):
             return reply
         except openai.OpenAIError as e:
             logger.error(f"[OpenAIError] {e}")
+            logger.error(f"[OpenAIError-DETAILS] {getattr(e, 'http_body', None)} {getattr(e, 'http_status', None)} {getattr(e, 'error', None)}")
             await asyncio.sleep(backoff)
         except Exception as e:
             logger.error(f"[Exception] {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             await asyncio.sleep(backoff)
     return "Sorry, something went wrong. Please try again later."
 
@@ -1047,16 +1050,22 @@ async def handle_user_payment(update, context, plan_key, method):
     plans = load_plans()
     plan = plans[plan_key]
     if method == 'stars':
-        await context.bot.send_invoice(
-            chat_id=update.effective_user.id,
-            title=f"📦 {plan['name']} Redeem Code",
-            description=f"Redeem code for {plan['name']} plan.",
-            payload=f"buy-{plan_key}-stars",
-            provider_token="",  # Telegram Stars
-            currency="XTR",
-            prices=[LabeledPrice(f"📦 {plan['name']} Redeem Code", plan['price_stars'])],
-            start_parameter=f"buy-{plan_key}-stars"
-        )
+        try:
+            await context.bot.send_invoice(
+                chat_id=update.effective_user.id,
+                title=f"📦 {plan['name']} Redeem Code",
+                description=f"Redeem code for {plan['name']} plan.",
+                payload=f"buy-{plan_key}-stars",
+                provider_token="",  # Telegram Stars
+                currency="XTR",
+                prices=[LabeledPrice(f"📦 {plan['name']} Redeem Code", plan['price_stars'])],
+                start_parameter=f"buy-{plan_key}-stars"
+            )
+        except Exception as e:
+            logger.error(f"[PAYMENT ERROR] Could not send invoice for plan {plan_key}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            await update.callback_query.edit_message_text("❌ Error sending payment invoice. Please contact support.")
     else:
         await update.callback_query.edit_message_text("❌ Only Telegram Stars payment is supported.")
 
