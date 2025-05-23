@@ -234,15 +234,14 @@ def pagination_buttons(page, total, callback_prefix):
 
 async def show_admin_panel(update, context):
     keyboard = [
-        [InlineKeyboardButton("🔄 Update Website Data", callback_data='admin_update_website_data')],
-        [InlineKeyboardButton("🗂️ Manage Plans", callback_data='admin_plans'),
-         InlineKeyboardButton("👤 Manage Subscriptions", callback_data='admin_subs'),
-         InlineKeyboardButton("💸 Set Price", callback_data='admin_set_price')],
-        [InlineKeyboardButton("🎟️ Redeem Codes", callback_data='admin_redeem'),
-         InlineKeyboardButton("👥 Users", callback_data='admin_users')],
-        [InlineKeyboardButton("📢 Broadcast", callback_data='admin_broadcast'),
+        [InlineKeyboardButton("⚙️ Settings", callback_data='admin_settings'),
          InlineKeyboardButton("📊 Stats", callback_data='admin_stats')],
-        [InlineKeyboardButton("📁 View Bot Files", callback_data='admin_view_files')]
+        [InlineKeyboardButton("🗂️ Manage Plans", callback_data='admin_plans'),
+         InlineKeyboardButton("💸 Set Price", callback_data='admin_set_price')],
+        [InlineKeyboardButton("👤 Manage Subscriptions", callback_data='admin_subs'),
+         InlineKeyboardButton("👥 Users", callback_data='admin_users')],
+        [InlineKeyboardButton("🎟️ Redeem Codes", callback_data='admin_redeem'),
+         InlineKeyboardButton("📢 Broadcast", callback_data='admin_broadcast')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     text = (
@@ -611,25 +610,36 @@ async def handle_admin_action_input(update: Update, context: ContextTypes.DEFAUL
         return
     elif action and action.startswith('remove_plan_'):
         plan_key = action[len('remove_plan_'):]
+        # Show Yes/No confirmation
+        confirm_keyboard = [
+            [InlineKeyboardButton("✅ Yes, remove", callback_data=f'confirm_remove_plan_{plan_key}'),
+             InlineKeyboardButton("❌ No, cancel", callback_data=f'plan_{plan_key}')]
+        ]
+        await update.callback_query.edit_message_text(
+            f"Are you sure you want to remove plan '<b>{plan_key.upper()}</b>'?",
+            reply_markup=InlineKeyboardMarkup(confirm_keyboard),
+            parse_mode='HTML'
+        )
+        await update.callback_query.answer()
+
+    elif action.startswith('confirm_remove_plan_'):
+        plan_key = action[len('confirm_remove_plan_'):]
         plans = load_plans()
         if plan_key in plans:
             codes_file = plans[plan_key]['codes_file']
             try:
                 del plans[plan_key]
                 save_plans(plans)
+                import os
                 if os.path.exists(codes_file):
                     os.remove(codes_file)
-                await update.message.reply_text(f"✅ Plan '{plan_key.upper()}' removed.")
+                await update.callback_query.edit_message_text(f"✅ Plan '{plan_key.upper()}' removed.")
             except Exception as e:
-                await update.message.reply_text(f"❌ Error removing plan: {e}")
+                await update.callback_query.edit_message_text(f"❌ Error removing plan: {e}")
         else:
-            await update.message.reply_text(f"❌ Plan '{plan_key.upper()}' not found.")
-        context.user_data['admin_action'] = None
-        class DummyCallback:
-            def __init__(self, message):
-                self.callback_query = type('obj', (object,), {'edit_message_text': message.edit_text})
-        await show_plans_menu(DummyCallback(update.message), context)
-        return
+            await update.callback_query.edit_message_text(f"❌ Plan '{plan_key.upper()}' not found.")
+        await show_plans_menu(update, context)
+
     context.user_data['admin_action'] = None
     # Return to appropriate menu
     if action == 'set_price':
@@ -1171,9 +1181,34 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer()
     elif data.startswith('remove_plan_'):
         plan_key = data[len('remove_plan_'):]
-        context.user_data['admin_action'] = f'remove_plan_{plan_key}'
-        await query.message.reply_text(f"Are you sure you want to remove plan '{plan_key.upper()}'? Send any message to confirm.")
+        # Show Yes/No confirmation
+        confirm_keyboard = [
+            [InlineKeyboardButton("✅ Yes, remove", callback_data=f'confirm_remove_plan_{plan_key}'),
+             InlineKeyboardButton("❌ No, cancel", callback_data=f'plan_{plan_key}')]
+        ]
+        await query.edit_message_text(
+            f"Are you sure you want to remove plan '<b>{plan_key.upper()}</b>'?",
+            reply_markup=InlineKeyboardMarkup(confirm_keyboard),
+            parse_mode='HTML'
+        )
         await query.answer()
+    elif data.startswith('confirm_remove_plan_'):
+        plan_key = data[len('confirm_remove_plan_'):]
+        plans = load_plans()
+        if plan_key in plans:
+            codes_file = plans[plan_key]['codes_file']
+            try:
+                del plans[plan_key]
+                save_plans(plans)
+                import os
+                if os.path.exists(codes_file):
+                    os.remove(codes_file)
+                await query.edit_message_text(f"✅ Plan '{plan_key.upper()}' removed.")
+            except Exception as e:
+                await query.edit_message_text(f"❌ Error removing plan: {e}")
+        else:
+            await query.edit_message_text(f"❌ Plan '{plan_key.upper()}' not found.")
+        await show_plans_menu(query, context)
     elif data.startswith('add_codes_'):
         plan_key = data[len('add_codes_'):]
         context.user_data['awaiting_codes'] = True
@@ -1241,15 +1276,20 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data['admin_action'] = 'remove_sub'
         await query.message.reply_text("Please enter the user ID or username to remove a subscription:")
         await query.answer()
+    elif data == 'admin_settings':
+        await show_settings_menu(update, context)
     elif data == 'admin_view_files':
+        import os
         try:
             cwd = os.getcwd()
             files = os.listdir('.')
             file_list = '\n'.join(files)
             escaped_file_list = html.escape(file_list)
+            keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data='admin_settings')]]
             await query.edit_message_text(
                 f"<b>Current working directory:</b> {cwd}\n"
                 f"<b>Bot Directory Files:</b>\n<pre>{escaped_file_list}</pre>",
+                reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='HTML'
             )
         except Exception as e:
@@ -1258,22 +1298,34 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     elif data == 'admin_update_website_data':
         # Show confirmation prompt
         confirm_keyboard = [
-            [InlineKeyboardButton("✅ Yes, update", callback_data='admin_confirm_update_website_data')],
-            [InlineKeyboardButton("⬅️ Back", callback_data='admin_main')]
+            [InlineKeyboardButton("✅ Yes, update", callback_data='admin_confirm_update_website_data'),
+             InlineKeyboardButton("⬅️ Back", callback_data='admin_settings')]
         ]
         await query.edit_message_text(
-            "Are you sure you want to update website data from cpanda.app?",
-            reply_markup=InlineKeyboardMarkup(confirm_keyboard)
+            "Are you sure you want to update website data from <a href='https://cpanda.app'>cpanda.app</a>?",
+            reply_markup=InlineKeyboardMarkup(confirm_keyboard),
+            parse_mode='HTML'
         )
         await query.answer()
     elif data == 'admin_confirm_update_website_data':
         import subprocess
+        await query.answer()  # Acknowledge immediately, no popup
+        await query.edit_message_text("🔄 Starting update...", parse_mode='HTML')
         try:
             subprocess.run(['python', 'cpanda_crawler.py'], check=True)
-            await query.message.reply_text("✅ Website data updated from cpanda.app!")
+            keyboard = [[InlineKeyboardButton("Back to Settings", callback_data='admin_settings')]]
+            await query.edit_message_text(
+                "✅ Update complete!\n\nTap below to return to Settings.",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='HTML'
+            )
         except Exception as e:
-            await query.message.reply_text(f"❌ Failed to update website data: {e}")
-        await query.answer()
+            keyboard = [[InlineKeyboardButton("Back to Settings", callback_data='admin_settings')]]
+            await query.edit_message_text(
+                f"❌ Failed to update website data: {e}\n\nTap below to return to Settings.",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='HTML'
+            )
 
 # === Rate Limiting ===
 class RateLimiter:
@@ -1491,6 +1543,20 @@ def save_users_info(users_info):
 # Load users_info at startup
 users_info_loaded = load_users_info()
 
+# Settings submenu
+async def show_settings_menu(update, context):
+    keyboard = [
+        [InlineKeyboardButton("📁 View Bot Files", callback_data='admin_view_files')],
+        [InlineKeyboardButton("🔄 Update Website Data", callback_data='admin_update_website_data')],
+        [InlineKeyboardButton("⬅️ Back", callback_data='admin_main')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    text = "<b>⚙️ Settings</b>\n<i>──────────────</i>\nChoose an option:"
+    if hasattr(update, 'callback_query') and update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
+
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     # Assign loaded users_info to bot_data
@@ -1504,7 +1570,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     # Admin panel: all admin callback_data starts with these
     app.add_handler(CallbackQueryHandler(admin_callback_handler,
-        pattern=r"^(admin_.*|plan_.*|add_plan|add_codes_.*|view_codes_.*|remove_code_.*|remove_plan_.*|add_redeem_codes.*|add_sub.*|remove_sub.*|view_redeem_codes.*|remove_redeem_code.*|users_page_.*|user_details_.*|admin_broadcast.*|admin_stats.*|admin_set_price.*|admin_update_website_data)$"))
+        pattern=r"^(admin_.*|plan_.*|add_plan|add_codes_.*|view_codes_.*|remove_code_.*|remove_plan_.*|add_redeem_codes.*|add_sub.*|remove_sub.*|view_redeem_codes.*|remove_redeem_code.*|users_page_.*|user_details_.*|admin_broadcast.*|admin_stats.*|admin_set_price.*|admin_update_website_data|admin_view_files)$"))
 
     # User panel
     app.add_handler(CallbackQueryHandler(user_callback_handler,
