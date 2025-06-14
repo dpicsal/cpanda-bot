@@ -1,1820 +1,3244 @@
-import os
+"""
+Panda AppStore Bot - Working Version
+Complete button-only interface with intelligent conversation management
+"""
+
+import asyncio
 import json
 import logging
-import asyncio
-import openai
-from datetime import datetime, timedelta, time as datetime_time
-from zoneinfo import ZoneInfo
-from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, LabeledPrice, ReplyKeyboardMarkup, KeyboardButton
-from telegram.constants import ChatAction
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters, JobQueue
-)
-from collections import defaultdict
-import time
-from typing import Dict, Set, Optional
+import os
+import platform
 import random
-from asyncio import create_task, CancelledError
-import html
 import re
+import time
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional, Set
 
-# === Load environment ===
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GROUP_ID = int(os.getenv("GROUP_ID", "-1000000000000"))
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-RESPONSE_TIMEOUT = 20  # seconds to wait for admin response
-LOCAL_TZ = ZoneInfo("Asia/Dubai")
-OPENAI_MODEL = "gpt-3.5-turbo"
-HISTORY_FILE = "conversation_history.json"
-REDEEM_CODES_FILE = "redeem_codes.txt"
-SUBSCRIPTION_PRICE_FILE = "subscription_price.txt"
-PLANS_FILE = "plans.json"
-ACTIVE_THREADS_FILE = "active_threads.json"
+import aiohttp
+import psutil
+from openai import OpenAI
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-# === Logging ===
+# Configure logging
 logging.basicConfig(
-    filename="bot.log",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    filename='bot.log'
 )
 logger = logging.getLogger(__name__)
-logging.Formatter.converter = lambda *args: datetime.now(LOCAL_TZ).timetuple()
 
-# === Memory ===
-def load_histories():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
+# Global variables
+BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+ADMIN_IDS = set(map(int, os.environ.get('ADMIN_IDS', '').split(','))) if os.environ.get('ADMIN_IDS') else set()
+GROUP_ID = int(os.environ.get('GROUP_ID', '0'))
+OXAPAY_API_KEY = os.environ.get('OXAPAY_API_KEY')
 
-def save_histories(histories):
-    with open(HISTORY_FILE, "w") as f:
-        json.dump(histories, f, indent=2)
+# Initialize OpenAI
+try:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    logger.info("OpenAI client initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize OpenAI client: {e}")
+    client = None
 
-conversation_histories = load_histories()
+# Constants
+TEMP_BAN_DURATION = 24 * 60 * 60  # 24 hours in seconds
+SPAM_THRESHOLD = 5  # messages
+SPAM_WINDOW = 60  # seconds
+SIMILARITY_THRESHOLD = 0.8
 
-def load_redeem_codes():
-    if not os.path.exists(REDEEM_CODES_FILE):
-        return set()
-    with open(REDEEM_CODES_FILE, "r") as f:
-        return set(line.strip() for line in f if line.strip())
-
-def save_redeem_codes(codes):
-    with open(REDEEM_CODES_FILE, "w") as f:
-        for code in codes:
-            f.write(f"{code}\n")
-
-# === PLAN MANAGEMENT HELPERS ===
-def load_plans():
-    if not os.path.exists(PLANS_FILE):
-        return {}
-    with open(PLANS_FILE, "r") as f:
-        return json.load(f)
-
-def save_plans(plans):
-    with open(PLANS_FILE, "w") as f:
-        json.dump(plans, f, indent=2)
-
-def load_plan_codes(plan_key):
-    plans = load_plans()
-    codes_file = plans[plan_key]["codes_file"]
-    if not os.path.exists(codes_file):
-        return set()
-    with open(codes_file, "r") as f:
-        return set(line.strip() for line in f if line.strip())
-
-def save_plan_codes(plan_key, codes):
-    plans = load_plans()
-    codes_file = plans[plan_key]["codes_file"]
-    with open(codes_file, "w") as f:
-        for code in codes:
-            f.write(f"{code}\n")
-
-# === AI ===
-def get_system_prompt():
-    return (
-        "🎉 Welcome to <b>Panda AppStore</b>! "
-        "I am your dedicated assistant for Panda AppStore services.\n\n"
-        "Important: Panda AppStore is a premium service with no free trial. Access requires a paid subscription.\n\n"
-        "I can help you with:\n"
-        "• Premium and modded iOS apps\n"
-        "• App installation guidance\n"
-        "• Subscription plans and pricing\n"
-        "• Redeem code purchases\n"
-        "• Technical support for Panda AppStore\n\n"
-        "Please note: I can only assist with Panda AppStore related queries. For other topics, please contact our support team."
-    )
-
-def is_panda_appstore_related(text: str) -> bool:
-    """Check if the message is related to Panda AppStore."""
-    panda_keywords = {
-        'panda', 'appstore', 'app store', 'ios', 'iphone', 'ipad', 'app', 'install',
-        'subscription', 'premium', 'mod', 'modded', 'redeem', 'code', 'purchase',
-        'buy', 'price', 'cost', 'plan', 'vip', 'premium', 'support', 'help'
-    }
-    text_lower = text.lower()
-    return any(keyword in text_lower for keyword in panda_keywords)
-
-def is_free_trial_query(text: str) -> bool:
-    """Check if the message is asking about free access or trial."""
-    free_keywords = {
-        'free', 'trial', 'free trial', 'no cost', 'without paying', 'free access',
-        'free version', 'free app', 'free service', 'free subscription'
-    }
-    text_lower = text.lower()
-    return any(keyword in text_lower for keyword in free_keywords)
-
-async def call_chatgpt(messages, max_tokens=200, retries=3, backoff=10):
-    logger.info(f"[DEBUG] call_chatgpt called with messages: {messages}")
+def initialize_data():
+    """Initialize all data storage"""
+    files = [
+        'data/conversation_histories.json',
+        'data/active_threads.json',
+        'data/admin_active.json',
+        'data/banned_users.json',
+        'data/user_spam_tracking.json',
+        'data/redeem_codes.json',
+        'data/payment_tracking.json',
+        'data/pending_star_payments.json',
+        'data/pricing_config.json'
+    ]
     
-    # Check if the last user message is Panda AppStore related
-    last_user_msg = next((msg['content'] for msg in reversed(messages) if msg['role'] == 'user'), None)
-    if last_user_msg:
-        if not is_panda_appstore_related(last_user_msg):
-            return "Hey there! 👋 I'm your Panda AppStore assistant, and I'd be happy to help you with anything related to our premium iOS apps, subscriptions, or support services. Feel free to ask me about those topics! 😊"
-        
-        # Handle free trial queries
-        if is_free_trial_query(last_user_msg):
-            return "Panda AppStore is a premium service that requires a paid subscription. We do not offer free trials or free access. You can view our subscription plans and pricing by using the menu options."
-    
-    for attempt in range(retries):
-        try:
-            logger.info(f"[ChatGPT] Attempt {attempt+1} with messages: {messages}")
-            response = await asyncio.to_thread(
-                openai.ChatCompletion.create,
-                model=OPENAI_MODEL,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=0.9
-            )
-            reply = response['choices'][0]['message']['content'].strip()
-            logger.info(f"[ChatGPT] Got reply: {reply}")
-            return reply
-        except openai.OpenAIError as e:
-            logger.error(f"[OpenAIError] {e}")
-            logger.error(f"[OpenAIError-DETAILS] {getattr(e, 'http_body', None)} {getattr(e, 'http_status', None)} {getattr(e, 'error', None)}")
-            await asyncio.sleep(backoff)
-        except Exception as e:
-            logger.error(f"[Exception] {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            await asyncio.sleep(backoff)
-    return "Sorry, something went wrong. Please try again later."
-
-def init_bot_data(ctx):
-    d = ctx.bot_data
-    d.setdefault("active_threads", {})
-    d.setdefault("admin_activity", {})
-    d.setdefault("users_info", {})
-    d.setdefault("ai_reply_tasks", {})  # Track scheduled AI reply tasks per thread
-    d.setdefault("admin_has_replied", {})  # Track if admin has replied per user/thread
-    d.setdefault("pause_for_20s", {})  # Track if AI should pause for 20s after admin reply per user/thread
-
-def load_active_threads():
-    if os.path.exists(ACTIVE_THREADS_FILE):
-        try:
-            with open(ACTIVE_THREADS_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def save_active_threads(active_threads):
-    with open(ACTIVE_THREADS_FILE, "w") as f:
-        json.dump(active_threads, f, indent=2)
-
-# Load active_threads on startup
-conversation_histories = load_histories()
-active_threads = load_active_threads()
-
-async def get_or_create_thread(context, user_id, username):
-    print(f"DEBUG: get_or_create_thread called for user_id={user_id}, username={username}")
-    # Use global active_threads
-    global active_threads
-    thread_id = active_threads.get(str(user_id))
-    if thread_id:
-        print(f"DEBUG: Found existing thread {thread_id} for user {user_id}")
-        context.bot_data['active_threads'] = active_threads
-        return thread_id
-    # Get user's display name: full name > username > user_id
-    user_info = context.bot_data.get('users_info', {}).get(str(user_id), {})
-    name = user_info.get('name')
-    display_name = name if name else "Customer"
-    lang = user_info.get('language_code', 'unknown')
-    flag = ''
-    if lang == 'hu':
-        flag = '🇭🇺'
-    try:
-        print(f"DEBUG: Creating new thread for user {user_id} with name {display_name}")
-        thread = await context.bot.create_forum_topic(
-            chat_id=GROUP_ID,
-            name=display_name  # Only name, no username or user ID
-        )
-        thread_id = thread.message_thread_id
-        active_threads[str(user_id)] = int(thread_id)
-        context.bot_data['active_threads'] = active_threads
-        save_active_threads(active_threads)
-        # Send user info message in the thread
-        user_link = f"tg://user?id={user_id}"
-        info_text = (
-            f"<b>• ID:</b> <a href='{user_link}'>{user_id}</a>\n"
-            f"<b>• Name:</b> <a href='{user_link}'>{display_name}</a>\n"
-            f"<b>• Language:</b> {lang} {flag}\n"
-            f"#id{user_id}"
-        )
-        keyboard = [
-            [
-                InlineKeyboardButton("Read ✅", callback_data=f"read_{user_id}"),
-                InlineKeyboardButton("Ban 🚫", callback_data=f"ban_{user_id}")
-            ]
-        ]
-        await context.bot.send_message(
-            chat_id=GROUP_ID,
-            message_thread_id=thread_id,
-            text=info_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
-        print(f"DEBUG: Created thread {thread_id} for user {user_id}")
-        return thread_id
-    except Exception as e:
-        print(f"DEBUG: Exception in get_or_create_thread: {e}")
-        logger.error(f"Thread create error: {e}")
-        return None
-
-async def is_admin_active(context, thread_id):
-    for admin_id in ADMIN_IDS:
-        admin_data = context.bot_data['admin_activity'].get(str(admin_id), {})
-        if admin_data.get("thread_id") == thread_id:
-            last_active = admin_data.get("last_active")
-            if last_active and (datetime.now(LOCAL_TZ) - last_active).total_seconds() < RESPONSE_TIMEOUT:
-                return True
-    return False
-
-# === Admin Menu UI Helpers ===
-def back_button(callback_data):
-    return [InlineKeyboardButton("⬅️ Back", callback_data=callback_data)]
-
-def pagination_buttons(page, total, callback_prefix):
-    buttons = []
-    if page > 0:
-        buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"{callback_prefix}_{page-1}"))
-    if (page + 1) * 10 < total:
-        buttons.append(InlineKeyboardButton("➡️ Next", callback_data=f"{callback_prefix}_{page+1}"))
-    return buttons
-
-async def show_admin_panel(update, context):
-    keyboard = [
-        [InlineKeyboardButton("⚙️ Settings", callback_data='admin_settings'),
-         InlineKeyboardButton("📊 Stats", callback_data='admin_stats')],
-        [InlineKeyboardButton("🗂️ Manage Plans", callback_data='admin_plans')],
-        [InlineKeyboardButton("👥 Users", callback_data='admin_users')],
-        [InlineKeyboardButton("🎟️ Redeem Codes", callback_data='admin_redeem')],
-        [InlineKeyboardButton("📢 Broadcast", callback_data='admin_broadcast')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    text = (
-        "<b>🐼 Panda AppStore <u>ADMIN PANEL</u></b>\n"
-        "<i>──────────────</i>\n"
-        "<b>Choose a section below:</b>"
-    )
-    if hasattr(update, 'callback_query') and update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
-    else:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
-
-async def show_plans_menu(update, context):
-    plans = load_plans()
-    keyboard = [
-        [InlineKeyboardButton(f"📦 {plan['name']} ({plan['price_stars']}⭐/$ {plan['price_usd']})", callback_data=f"plan_{key}")]
-        for key, plan in plans.items()
-    ]
-    keyboard.append([InlineKeyboardButton("➕ Add Plan", callback_data="add_plan")])
-    keyboard.append(back_button("admin_main"))
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    text = "<b>🗂️ Manage Plans</b>\n<i>──────────────</i>\nSelect a plan to manage:"
-    if hasattr(update, 'callback_query') and update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
-    else:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
-
-async def show_plan_detail_menu(update, context, plan_key):
-    plans = load_plans()
-    plan = plans[plan_key]
-    text = (
-        f"<b>📦 {plan['name']}</b>\n"
-        f"Price: <b>{plan['price_stars']}⭐</b> / <b>${plan['price_usd']}</b>\n"
-        "<i>──────────────</i>\n"
-        f"Details: {plan.get('details', 'No details set.')}\n"
-        f"Other Payment: {plan.get('other_payment', 'Not set')}\n"
-        "Manage codes for this plan."
-    )
-    keyboard = [
-        [InlineKeyboardButton("✏️ Edit Details", callback_data=f"edit_details_{plan_key}")],
-        [InlineKeyboardButton("💸 Edit Other Payment", callback_data=f"edit_other_payment_{plan_key}")],
-        [InlineKeyboardButton("➕ Add Codes", callback_data=f"add_codes_{plan_key}")],
-        [InlineKeyboardButton("📄 View Codes", callback_data=f"view_codes_{plan_key}_0")],
-        [InlineKeyboardButton("❌ Remove Code", callback_data=f"remove_code_{plan_key}")],
-        [InlineKeyboardButton("❌ Remove Plan", callback_data=f"remove_plan_{plan_key}")]
-    ]
-    keyboard.append(back_button("admin_plans"))
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.callback_query.edit_message_text(
-        text,
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-
-async def show_subs_menu(update, context):
-    keyboard = [
-        [InlineKeyboardButton("➕ Add Subscription", callback_data='add_sub'),
-         InlineKeyboardButton("➖ Remove Subscription", callback_data='remove_sub')]
-    ]
-    keyboard.append(back_button("admin_main"))
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.callback_query.edit_message_text(
-        "<b>👤 Manage Subscriptions</b>\n<i>──────────────</i>\nChoose an action:",
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-
-async def show_redeem_menu(update, context):
-    keyboard = [
-        [InlineKeyboardButton("➕ Add Redeem Codes", callback_data='add_redeem_codes')],
-        [InlineKeyboardButton("📄 View Codes", callback_data='view_redeem_codes')],
-        [InlineKeyboardButton("❌ Remove Code", callback_data='remove_redeem_code')]
-    ]
-    keyboard.append(back_button("admin_main"))
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.callback_query.edit_message_text(
-        "<b>🎟️ Redeem Codes</b>\n<i>──────────────</i>\nAdd, view, or remove redeem codes.",
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-
-async def show_codes_page(update, context, page=0, per_page=10):
-    codes = sorted(list(load_redeem_codes()))
-    total = len(codes)
-    start = page * per_page
-    end = start + per_page
-    page_codes = codes[start:end]
-    text = "<b>🎟️ Redeem Codes</b>\n<i>──────────────</i>\n" + ("\n".join(page_codes) if page_codes else "No codes available.")
-    text += f"\n\nPage {page+1} of {((total-1)//per_page)+1 if total else 1}"
-    nav = pagination_buttons(page, total, "view_redeem_codes")
-    keyboard = []
-    if nav:
-        keyboard.append(nav)
-    keyboard.append(back_button('admin_redeem'))
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.callback_query.edit_message_text(
-        text,
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-
-async def show_plan_codes_page(update, context, plan_key, page=0, per_page=10):
-    codes = sorted(list(load_plan_codes(plan_key)))
-    total = len(codes)
-    start = page * per_page
-    end = start + per_page
-    page_codes = codes[start:end]
-    text = f"<b>📦 Codes for {plan_key.upper()}</b>\n<i>──────────────</i>\n" + ("\n".join(page_codes) if page_codes else "No codes available.")
-    text += f"\n\nPage {page+1} of {((total-1)//per_page)+1 if total else 1}"
-    nav = []
-    if start > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"view_codes_{plan_key}_{page-1}"))
-    if end < total:
-        nav.append(InlineKeyboardButton("➡️ Next", callback_data=f"view_codes_{plan_key}_{page+1}"))
-    keyboard = []
-    if nav:
-        keyboard.append(nav)
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="user_panel")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.callback_query.edit_message_text(
-        text,
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-
-async def show_users_page(update, context, page=0, per_page=10):
-    users_info = context.bot_data.get('users_info', {})
-    user_ids = sorted(users_info.keys(), key=lambda x: int(x))
-    total = len(user_ids)
-    start = page * per_page
-    end = start + per_page
-    page_users = user_ids[start:end]
-    text = "<b>👥 Users</b>\n<i>──────────────</i>\n" + ("\n".join([
-        f"{users_info[uid].get('username', '-') or '-'} | {users_info[uid].get('name', '-')}" for uid in page_users
-    ]) if page_users else "No users found.")
-    text += f"\n\nPage {page+1} of {((total-1)//per_page)+1 if total else 1}"
-    keyboard = [
-        [InlineKeyboardButton(f"@{users_info[uid].get('username', '-') or users_info[uid].get('name', '-')}", callback_data=f'user_details_{uid}')]
-        for uid in page_users
-    ]
-    nav = pagination_buttons(page, total, "users_page")
-    if nav:
-        keyboard.append(nav)
-    keyboard.append(back_button('admin_main'))
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.callback_query.edit_message_text(
-        text,
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-
-async def show_user_details(update, context, uid):
-    users_info = context.bot_data.get('users_info', {})
-    info = users_info.get(uid, {})
-    text = (
-        f"<b>👤 User Details</b>\n<i>──────────────</i>\n"
-        f"ID: <code>{uid}</code>\n"
-        f"Name: <b>{info.get('name', '-') or '-'}</b>\n"
-        f"Username: @{info.get('username', '-') or '-'}\n"
-    )
-    keyboard = []
-    keyboard.append(back_button('admin_users'))
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.callback_query.edit_message_text(
-        text,
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-
-async def show_broadcast_menu(update, context):
-    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='admin_main')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.callback_query.edit_message_text(
-        "<b>📢 Broadcast</b>\n<i>──────────────</i>\nPlease send the message you want to broadcast to all users.",
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-    context.user_data['admin_action'] = 'broadcast'
-
-async def show_stats_menu(update, context):
-    users_info = context.bot_data.get('users_info', {})
-    total_users = len(users_info)
-    price = load_subscription_price()
-    approx_usd = round(price * 0.016, 2)
-    codes = load_redeem_codes()
-    total_codes = len(codes)
-    active_subs = 0
-    text = (
-        f"<b>📊 Panda AppStore Bot Stats</b>\n<i>──────────────</i>\n"
-        f"👥 Total users: <b>{total_users}</b>\n"
-        f"⭐️ Active subscriptions: <b>{active_subs}</b>\n"
-        f"🎟️ Redeem codes available: <b>{total_codes}</b>\n"
-        f"💸 Current subscription price: <b>{price} Stars</b> (≈ ${approx_usd})"
-    )
-    keyboard = []
-    keyboard.append(back_button('admin_main'))
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.callback_query.edit_message_text(
-        text,
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    init_bot_data(context)
-    uid = update.effective_user.id
-    context.bot_data["users_info"][str(uid)] = {
-        "username": update.effective_user.username,
-        "name": update.effective_user.full_name
-    }
-    save_users_info(context.bot_data["users_info"])
-    # Promotional welcome message
-    promo_msg = (
-        "🎉 Welcome to <b>Panda AppStore</b>!\n"
-        "Unlock a world of premium and modded iOS apps, hassle-free installation, and exclusive features.\n\n"
-        "Need help choosing a plan or have a question? I'm here for you!"
-    )
-    if uid in ADMIN_IDS and update.effective_chat.type == 'private':
-        await update.message.reply_text(
-            promo_msg + "\n\n<b>Admin access detected. Loading admin panel...</b>",
-            parse_mode='HTML',
-            reply_markup=ReplyKeyboardRemove()
-        )
-        await show_admin_panel(update, context)
-        return
-    await update.message.reply_text(
-        promo_msg,
-        parse_mode='HTML',
-        reply_markup=ReplyKeyboardRemove()
-    )
-    await show_user_panel(update, context)
-
-async def list_threads(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Unauthorized")
-        return
-    threads = context.bot_data.get("active_threads", {})
-    if not threads:
-        await update.message.reply_text("No active customer threads.")
-        return
-    lines = []
-    for uid, tid in threads.items():
-        uname = context.bot_data["users_info"].get(uid, {}).get("username", uid)
-        lines.append(f"Thread {tid}: @{uname}")
-    await update.message.reply_text("\\n".join(lines))
-
-async def send_realistic_typing_and_message(bot, chat_id, text, parse_mode=None):
-    chars_per_sec = 5
-    min_delay = 1.5
-    max_delay = 10
-    typing_time = max(min_delay, min(len(text) / chars_per_sec, max_delay))
-    elapsed = 0
-    while elapsed < typing_time:
-        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        await asyncio.sleep(2)
-        elapsed += 2
-    await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode) if parse_mode else await bot.send_message(chat_id=chat_id, text=text)
-
-async def handle_admin_action_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Handle editing plan details and other payment info FIRST
-    if context.user_data.get('edit_plan_details'):
-        plan_key = context.user_data.pop('edit_plan_details')
-        plans = load_plans()
-        plans[plan_key]['details'] = update.message.text.strip()
-        save_plans(plans)
-        await update.message.reply_text(f"✅ Details updated for {plan_key.upper()}.")
-        await show_plan_detail_menu(update, context, plan_key)
-        return
-    if context.user_data.get('edit_plan_other_payment'):
-        plan_key = context.user_data.pop('edit_plan_other_payment')
-        plans = load_plans()
-        plans[plan_key]['other_payment'] = update.message.text.strip()
-        save_plans(plans)
-        await update.message.reply_text(f"✅ Other payment info updated for {plan_key.upper()}.")
-        await show_plan_detail_menu(update, context, plan_key)
-        return
-    # Step-by-step Add Plan flow (must be at the top to avoid early returns)
-    if context.user_data.get('add_plan_step') == 'name':
-        plan_name = update.message.text.strip()
-        context.user_data['add_plan_name'] = plan_name
-        context.user_data['add_plan_step'] = 'desc'
-        await update.message.reply_text("Enter the plan description:")
-        return
-    elif context.user_data.get('add_plan_step') == 'desc':
-        plan_desc = update.message.text.strip()
-        context.user_data['add_plan_desc'] = plan_desc
-        context.user_data['add_plan_step'] = 'stars'
-        await update.message.reply_text("Enter the price in Stars (e.g., 3000):")
-        return
-    elif context.user_data.get('add_plan_step') == 'stars':
-        stars = update.message.text.strip()
-        if not stars.isdigit():
-            await update.message.reply_text("❌ Please enter a valid number for Stars.")
-            return
-        context.user_data['add_plan_stars'] = stars
-        context.user_data['add_plan_step'] = 'usd'
-        await update.message.reply_text("Enter the price in USD (e.g., 50):")
-        return
-    elif context.user_data.get('add_plan_step') == 'usd':
-        usd = update.message.text.strip()
-        try:
-            float(usd)
-        except Exception:
-            await update.message.reply_text("❌ Please enter a valid number for USD.")
-            return
-        context.user_data['add_plan_usd'] = usd
-        context.user_data['add_plan_step'] = 'confirm'
-        name = context.user_data['add_plan_name']
-        desc = context.user_data['add_plan_desc']
-        stars = context.user_data['add_plan_stars']
-        summary = (
-            f"Please confirm the new plan:\n"
-            f"<b>{name.upper()} PLAN : ${usd} | ⭐{stars}</b>\n"
-            f"Description: {desc}"
-        )
-        keyboard = [
-            [InlineKeyboardButton("✅ Confirm", callback_data='confirm_add_plan'),
-             InlineKeyboardButton("❌ Cancel", callback_data='cancel_add_plan')]
-        ]
-        await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-        return
-
-    action = context.user_data.get('admin_action')
-    logger.info(f"[DEBUG] handle_admin_action_input called. action={action}, text={update.message.text if update.message else None}")
-    if not action:
-        await handle_admin_code_input(update, context)
-        return  # Let the message fall through to the next handler
-    user_input = update.message.text.strip()
-    if action == 'add_sub':
-        await update.message.reply_text(f"✅ Subscription added for {user_input} (placeholder).")
-        await asyncio.sleep(1.5)
-        await show_subs_menu(update, context)
-        return
-    elif action == 'remove_sub':
-        await update.message.reply_text(f"✅ Subscription removed for {user_input} (placeholder).")
-        await asyncio.sleep(1.5)
-        await show_subs_menu(update, context)
-        return
-    elif action == 'set_price':
-        try:
-            user_input = user_input.strip()
-            price = int(user_input)
-            save_subscription_price(price)
-            approx_usd = round(price * 0.016, 2)
-            await update.message.reply_text(f"✅ Subscription price updated to {price} Stars (≈ ${approx_usd}).")
-            await asyncio.sleep(1.5)
-            await show_set_price_menu(update, context)
-            context.user_data['admin_action'] = None
-            return
-        except Exception as e:
-            logger.error(f"[SET_PRICE ERROR] Could not parse price: {user_input} Exception: {e}")
-            await update.message.reply_text("❌ Invalid price. Please enter a number in Stars.")
-            await asyncio.sleep(1.5)
-            await show_set_price_menu(update, context)
-            context.user_data['admin_action'] = None
-            return
-    elif action == 'remove_code':
-        codes = load_redeem_codes()
-        if user_input in codes:
-            codes.remove(user_input)
-            save_redeem_codes(codes)
-            await update.message.reply_text(f"✅ Code '{user_input}' removed.")
-        else:
-            await update.message.reply_text(f"❌ Code '{user_input}' not found.")
-        await asyncio.sleep(1.5)
-        class DummyCallback:
-            def __init__(self, message):
-                self.callback_query = type('obj', (object,), {'edit_message_text': message.edit_text})
-        await show_codes_page(DummyCallback(update.message), context, page=0)
-        context.user_data['admin_action'] = None
-        return
-    elif action == 'broadcast':
-        users_info = context.bot_data.get('users_info', {})
-        admin_id = str(update.effective_user.id)
-        all_user_ids = set(users_info.keys()) | {admin_id}
-        count = 0
-        failed = 0
-        failed_details = []
-        brand_header = "🐼 <b>Panda AppStore Broadcast</b>\n<i>──────────────</i>\n"
-        brand_footer = "\n\n<i>Thank you for being with Panda AppStore!</i>"
-        for uid in all_user_ids:
-            try:
-                broadcast_message = f"{brand_header}{user_input}{brand_footer}"
-                await context.bot.send_message(chat_id=int(uid), text=broadcast_message, parse_mode='HTML')
-                count += 1
-                await asyncio.sleep(0.05)
-            except Exception as e:
-                logger.error(f"[BROADCAST ERROR] Could not send to {uid}: {e}")
-                failed += 1
-                failed_details.append(f"{uid}: {e}")
-        summary = f"✅ Broadcast sent to <b>{count}</b> users."
-        if failed:
-            summary += f"\n❌ Failed to send to <b>{failed}</b> users:"
-            summary += "\n" + "\n".join(failed_details)
-        await update.message.reply_text(summary, parse_mode='HTML')
-        await asyncio.sleep(1.5)
-        context.user_data['admin_action'] = None
-        class DummyCallback:
-            def __init__(self, message):
-                self.callback_query = type('obj', (object,), {'edit_message_text': message.edit_text})
-        await show_admin_panel(DummyCallback(update.message), context)
-        return
-    elif action == 'add_plan':
-        context.user_data['add_plan_step'] = 'name'
-        await update.message.reply_text("Please enter the plan name (e.g., VIP, PREMIUM, etc.):")
-        return
-    elif action == 'cancel_add_plan':
-        context.user_data.pop('add_plan_step', None)
-        context.user_data.pop('add_plan_name', None)
-        context.user_data.pop('add_plan_desc', None)
-        context.user_data.pop('add_plan_stars', None)
-        context.user_data.pop('add_plan_usd', None)
-        await show_plans_menu(update, context)
-    elif action == 'confirm_add_plan':
-        name = context.user_data.get('add_plan_name')
-        desc = context.user_data.get('add_plan_desc')
-        stars = context.user_data.get('add_plan_stars')
-        usd = context.user_data.get('add_plan_usd')
-        plans = load_plans()
-        plan_key = name.lower().replace(' ', '_')
-        if plan_key in plans:
-            await update.message.reply_text(f"❌ Plan '{name}' already exists.")
-            await asyncio.sleep(1.5)
-            await show_plans_menu(update, context)
-            return
-        codes_file = f"codes_{plan_key}.txt"
-        plans[plan_key] = {
-            'name': name,
-            'details': desc,
-            'price_stars': int(stars),
-            'price_usd': float(usd),
-            'codes_file': codes_file
-        }
-        save_plans(plans)
-        with open(codes_file, 'w') as f:
-            pass
-        await update.message.reply_text(f"✅ Plan '{name}' added.")
-        context.user_data.pop('add_plan_step', None)
-        context.user_data.pop('add_plan_name', None)
-        context.user_data.pop('add_plan_desc', None)
-        context.user_data.pop('add_plan_stars', None)
-        context.user_data.pop('add_plan_usd', None)
-        await asyncio.sleep(1.5)
-        await show_plans_menu(update, context)
-    elif action.startswith('remove_plan_'):
-        plan_key = action[len('remove_plan_'):]
-        # Show Yes/No confirmation
-        confirm_keyboard = [
-            [InlineKeyboardButton("✅ Yes, remove", callback_data=f'confirm_remove_plan_{plan_key}'),
-             InlineKeyboardButton("❌ No, cancel", callback_data=f'plan_{plan_key}')]
-        ]
-        await update.callback_query.edit_message_text(
-            f"Are you sure you want to remove plan '<b>{plan_key.upper()}</b>'?",
-            reply_markup=InlineKeyboardMarkup(confirm_keyboard),
-            parse_mode='HTML'
-        )
-        await update.callback_query.answer()
-
-    elif action.startswith('confirm_remove_plan_'):
-        plan_key = action[len('confirm_remove_plan_'):]
-        plans = load_plans()
-        if plan_key in plans:
-            codes_file = plans[plan_key]['codes_file']
-            try:
-                del plans[plan_key]
-                save_plans(plans)
-                import os
-                if os.path.exists(codes_file):
-                    os.remove(codes_file)
-                await update.callback_query.edit_message_text(f"✅ Plan '{plan_key.upper()}' removed.")
-                await asyncio.sleep(1.5)
-                await show_plans_menu(update, context)
-            except Exception as e:
-                await update.callback_query.edit_message_text(f"❌ Error removing plan: {e}")
-                await asyncio.sleep(1.5)
-                await show_plans_menu(update, context)
-        else:
-            await update.callback_query.edit_message_text(f"❌ Plan '{plan_key.upper()}' not found.")
-            await asyncio.sleep(1.5)
-            await show_plans_menu(update, context)
-
-    context.user_data['admin_action'] = None
-    # Return to appropriate menu
-    if action == 'set_price':
-        class DummyCallback:
-            def __init__(self, message):
-                self.callback_query = type('obj', (object,), {'edit_message_text': message.edit_text})
-        await show_set_price_menu(DummyCallback(update.message), context)
-    else:
-        class DummyCallback:
-            def __init__(self, message):
-                self.callback_query = type('obj', (object,), {'edit_message_text': message.edit_text})
-        await show_subs_menu(DummyCallback(update.message), context)
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("DEBUG: handle_message called")
-    init_bot_data(context)
-    uid = str(update.effective_user.id)
-    username = update.effective_user.username or uid
-    text = update.message.text.strip()
-    message_id = update.message.message_id
-
-    # Admin reply from group thread
-    if update.effective_user.id in ADMIN_IDS and update.effective_chat.id == GROUP_ID and update.message.message_thread_id:
-        print("DEBUG: Admin reply in group thread")
-        customer_id = None
-        for cid, tid in context.bot_data['active_threads'].items():
-            if int(tid) == update.message.message_thread_id:
-                customer_id = cid
-                break
-        if customer_id:
-            try:
-                print(f"DEBUG: Sending admin reply to user {customer_id}")
-                # Set pause_for_20s for this user/thread
-                pause_map = context.bot_data.setdefault('pause_for_20s', {})
-                pause_key = f"{customer_id}:{update.message.message_thread_id}"
-                pause_map[pause_key] = True
-                # Cancel pending AI reply for this user
-                ai_tasks = context.bot_data.setdefault('ai_reply_tasks', {})
-                prev_task = ai_tasks.pop(customer_id, None)
-                if prev_task and not prev_task.done():
-                    prev_task.cancel()
-                await send_realistic_typing_and_message(context.bot, customer_id, text)
-                conversation_histories.setdefault(customer_id, []).append({"role": "assistant", "content": text})
-                save_histories(conversation_histories)
-                await context.bot.send_message(
-                    chat_id=GROUP_ID,
-                    message_thread_id=update.message.message_thread_id,
-                    text=f"✅ Admin reply sent to <a href='tg://user?id={customer_id}'>{customer_id}</a>:\n{text}",
-                    parse_mode='HTML'
-                )
-                context.bot_data['admin_activity'][str(update.effective_user.id)] = {
-                    "thread_id": update.message.message_thread_id,
-                    "last_active": datetime.now(LOCAL_TZ)
-                }
-            except Exception as e:
-                logger.error(f"Failed to send admin reply: {e}")
-        return
-
-    # Customer message - only process if it's a private message
-    if update.effective_chat.type == 'private' and uid not in map(str, ADMIN_IDS):
-        print("DEBUG: User message in private chat")
-        thread_id = await get_or_create_thread(context, uid, username)
-        if not thread_id:
-            print("DEBUG: Thread creation failed")
-            return
-
-        # Echo user message in group thread, with auto-recovery if thread not found
-        try:
-            await context.bot.send_message(
-                chat_id=GROUP_ID,
-                message_thread_id=thread_id,
-                text=f"👤 New message from <a href='tg://user?id={uid}'>@{username}</a>:\n{text}",
-                parse_mode='HTML'
-            )
-            print("DEBUG: Sent user message to group thread")
-        except Exception as e:
-            print(f"DEBUG: Exception sending user message to group thread: {e}")
-            if 'Message thread not found' in str(e):
-                print(f"DEBUG: Removing broken thread {thread_id} for user {uid} and retrying...")
-                active_threads.pop(uid, None)
-                save_active_threads(active_threads)
-                thread_id = await get_or_create_thread(context, uid, username)
-                if not thread_id:
-                    print("DEBUG: Thread creation failed on retry")
-                    return
-                try:
-                    await context.bot.send_message(
-                        chat_id=GROUP_ID,
-                        message_thread_id=thread_id,
-                        text=f"👤 New message from <a href='tg://user?id={uid}'>@{username}</a>:\n{text}",
-                        parse_mode='HTML'
-                    )
-                    print("DEBUG: Sent user message to group thread after recovery")
-                except Exception as e2:
-                    print(f"DEBUG: Exception sending user message to group thread after recovery: {e2}")
-                    return
+    for file_path in files:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        if not os.path.exists(file_path):
+            if file_path.endswith('pricing_config.json'):
+                save_json_file(file_path, {'usd_amount': 35.0, 'stars_amount': 2500})
             else:
-                return
+                save_json_file(file_path, {})
 
-        hist = conversation_histories.setdefault(uid, [])
-        hist.append({"role": "user", "content": text})
-        save_histories(conversation_histories)
-
-        pause_map = context.bot_data.setdefault('pause_for_20s', {})
-        pause_key = f"{uid}:{thread_id}"
-        ai_tasks = context.bot_data.setdefault('ai_reply_tasks', {})
-        prev_task = ai_tasks.pop(uid, None)
-        if prev_task and not prev_task.done():
-            prev_task.cancel()
-
-        if pause_map.get(pause_key, False):
-            # Pause for 20s for admin reply, then reset flag
-            print("DEBUG: Pausing for 20s after admin reply")
-            async def delayed_ai_reply():
-                try:
-                    await context.bot.send_message(
-                        chat_id=GROUP_ID,
-                        message_thread_id=thread_id,
-                        text=f"⏳ Waiting {RESPONSE_TIMEOUT} seconds for admin reply before AI responds to @{username}..."
-                    )
-                    await asyncio.sleep(RESPONSE_TIMEOUT)
-                    # If not cancelled, send AI reply and reset pause flag
-                    print("DEBUG: Calling AI after 20s pause")
-                    messages = [{"role": "system", "content": get_system_prompt()}] + hist
-                    reply = await call_chatgpt(messages)
-                    print(f"DEBUG: AI replied: {reply}")
-                    hist.append({"role": "assistant", "content": reply})
-                    save_histories(conversation_histories)
-                    await send_realistic_typing_and_message(context.bot, uid, reply)
-                    await context.bot.send_message(
-                        chat_id=GROUP_ID,
-                        message_thread_id=thread_id,
-                        text=f"✅ AI reply sent to <a href='tg://user?id={uid}'>@{username}</a>:\n{reply}",
-                        parse_mode='HTML'
-                    )
-                    pause_map[pause_key] = False
-                except CancelledError:
-                    print(f"DEBUG: AI reply for user {uid} was cancelled due to admin reply.")
-                    pause_map[pause_key] = False
-                except Exception as e:
-                    print(f"DEBUG: Exception in delayed_ai_reply: {e}")
-                    pause_map[pause_key] = False
-            ai_task = create_task(delayed_ai_reply())
-            ai_tasks[uid] = ai_task
-            context.bot_data['ai_reply_tasks'] = ai_tasks
-        else:
-            # AI replies instantly
-            print("DEBUG: AI replies instantly (no pause)")
-            messages = [{"role": "system", "content": get_system_prompt()}] + hist
-            reply = await call_chatgpt(messages)
-            print(f"DEBUG: AI replied: {reply}")
-            hist.append({"role": "assistant", "content": reply})
-            save_histories(conversation_histories)
-            await send_realistic_typing_and_message(context.bot, uid, reply)
-            await context.bot.send_message(
-                chat_id=GROUP_ID,
-                message_thread_id=thread_id,
-                text=f"✅ AI reply sent to <a href='tg://user?id={uid}'>@{username}</a>:\n{reply}",
-                parse_mode='HTML'
-            )
-        return
-
-    # Ignore messages from admins in private chat
-    elif update.effective_chat.type == 'private' and uid in map(str, ADMIN_IDS):
-        return
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"[DEBUG] Fallback callback_handler called with data: {update.callback_query.data}")  # Added logging
-    query = update.callback_query
-    await query.answer()
-    if query.data.startswith("reply:"):
-        _, customer_id, thread_id = query.data.split(":")
-        context.user_data["reply_to"] = customer_id
-        context.user_data["thread_id"] = int(thread_id)
-        await query.message.reply_text(f"✍️ Type your reply to user {customer_id}:")
-    elif query.data.startswith("read_"):
-        user_id = query.data.split("_", 1)[1]
-        await query.message.reply_text(f"Marked as read for user {user_id}.")
-    elif query.data.startswith("ban_"):
-        user_id = query.data.split("_", 1)[1]
-        await query.message.reply_text(f"User {user_id} banned (not implemented).")
-
-# === Handle Photos and Documents ===
-async def handle_photo_or_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    init_bot_data(context)
-    uid = str(update.effective_user.id)
-    username = update.effective_user.username or uid
-    message_id = update.message.message_id
-    thread_id = await get_or_create_thread(context, uid, username)
-
-    file_type = "photo" if update.message.photo else "document"
-    caption = update.message.caption or "(no caption)"
-
-    if file_type == "photo":
-        file_id = update.message.photo[-1].file_id  # highest resolution
-    else:
-        file_id = update.message.document.file_id
-
-    if not thread_id:
-        await update.message.reply_text("⚠️ Error creating support thread.")
-        return
-
-    # Forward file to group thread
+def load_json_file(filename: str, default: Any = None) -> Any:
+    """Load JSON data from file with error handling"""
     try:
-        if file_type == "photo":
-            await context.bot.send_photo(
-                chat_id=GROUP_ID,
-                message_thread_id=thread_id,
-                photo=file_id,
-                caption=f"📸 New {file_type} from @{username}:\n{caption}"
-            )
-        else:
-            await context.bot.send_document(
-                chat_id=GROUP_ID,
-                message_thread_id=thread_id,
-                document=file_id,
-                caption=f"📎 New {file_type} from @{username}:\n{caption}"
-            )
-        await update.message.reply_text("✅ Received. A support agent will review it shortly.")
+        if os.path.exists(filename):
+            with open(filename, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return default if default is not None else {}
+    except (json.JSONDecodeError, FileNotFoundError) as e:
+        logger.error(f"Error loading {filename}: {e}")
+        return default if default is not None else {}
+
+def save_json_file(filename: str, data: Any) -> bool:
+    """Save data to JSON file with error handling"""
+    try:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return True
     except Exception as e:
-        logger.error(f"Failed to forward file: {e}")
-        await update.message.reply_text("⚠️ Error sending your file. Please try again later.")
-
-# === Admin Media Reply in Group Thread ===
-async def handle_admin_media_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    if update.effective_chat.id != GROUP_ID:
-        return
-    thread_id = update.message.message_thread_id
-    if not thread_id:
-        return
-
-    customer_id = None
-    for cid, tid in context.bot_data['active_threads'].items():
-        if int(tid) == thread_id:
-            customer_id = cid
-            break
-    if not customer_id:
-        await update.message.reply_text("❌ Could not find the customer.")
-        return
-
-    try:
-        # First, try to send a typing action to ensure the chat is accessible
-        await context.bot.send_chat_action(
-            chat_id=customer_id,
-            action=ChatAction.TYPING
-        )
-
-        # Forward the entire message directly from the group to the user
-        await context.bot.forward_message(
-            chat_id=customer_id,
-            from_chat_id=update.effective_chat.id,
-            message_id=update.message.message_id
-        )
-
-        # Update admin activity
-        context.bot_data['admin_activity'][str(update.effective_user.id)] = {
-            "thread_id": thread_id,
-            "last_active": datetime.now(LOCAL_TZ)
-        }
-
-        # Confirm in group thread
-        await update.message.reply_text(f"✅ Media sent to the customer.")
-        
-        # Log successful send
-        logger.info(f"Successfully sent media to user {customer_id}")
-
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Failed to send media to user {customer_id}: {error_msg}")
-        
-        # More specific error messages based on the error type
-        if "File too large" in error_msg:
-            error_response = "⚠️ The file is too large to send. Please try sending a smaller file."
-        elif "Bad Request" in error_msg:
-            error_response = "⚠️ Invalid file format. Please try sending a different file."
-        elif "Forbidden" in error_msg:
-            error_response = "⚠️ Cannot send to this user. They may have blocked the bot."
-        elif "Message thread not found" in error_msg:
-            error_response = "⚠️ Thread not found. Please try sending the message again."
-            # Try to recreate the thread
-            try:
-                new_thread_id = await get_or_create_thread(context, customer_id, context.bot_data["users_info"].get(str(customer_id), {}).get("username", str(customer_id)))
-                if new_thread_id:
-                    logger.info(f"Successfully recreated thread {new_thread_id} for user {customer_id}")
-                    await update.message.reply_text("Thread recreated. Please try sending the media again.")
-            except Exception as recreate_error:
-                logger.error(f"Failed to recreate thread: {recreate_error}")
-        else:
-            error_response = f"⚠️ Failed to send media. Error: {error_msg}"
-        
-        await update.message.reply_text(error_response)
-        
-        # Try to notify the user about the error
-        try:
-            await context.bot.send_message(
-                chat_id=customer_id,
-                text="⚠️ We encountered an error while sending you the file. Please try again later."
-            )
-        except Exception as notify_error:
-            logger.error(f"Failed to notify user about send error: {notify_error}")
-
-async def set_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Unauthorized")
-        return
-    try:
-        seconds = int(context.args[0])
-        global RESPONSE_TIMEOUT
-        RESPONSE_TIMEOUT = seconds
-        await update.message.reply_text(f"✅ AI wait timeout set to {seconds} seconds.")
-    except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Usage: /settimeout <seconds>")
-
-# === Follow-up Reminder ===
-FOLLOWUP_DELAY = 24 * 60 * 60  # 24 hours in seconds
-FOLLOWUP_TEXT = "Hi! Just checking in—was your issue resolved? If not, reply here and we'll help you further."
-
-def schedule_followup(context, user_id):
-    # Cancel any previous follow-up for this user
-    if 'followup_tasks' not in context.bot_data:
-        context.bot_data['followup_tasks'] = {}
-    tasks = context.bot_data['followup_tasks']
-    prev_task = tasks.pop(user_id, None)
-    if prev_task and not prev_task.done():
-        prev_task.cancel()
-    async def followup_task():
-        try:
-            await asyncio.sleep(FOLLOWUP_DELAY)
-            await context.bot.send_message(chat_id=user_id, text=FOLLOWUP_TEXT)
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            logger.error(f"[FOLLOWUP ERROR] {e}")
-    task = asyncio.create_task(followup_task())
-    tasks[user_id] = task
-    context.bot_data['followup_tasks'] = tasks
-
-# === Payment/Subscription ===
-PAYMENT_PROVIDER_TOKEN = "YOUR_PAYMENT_PROVIDER_TOKEN"  # Replace with your real token
-
-async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    title = "Panda AppStore Subscription"
-    description = "1-month premium subscription to Panda AppStore."
-    payload = "panda-subscription-001"
-    currency = "USD"
-    price = 499  # $4.99 in cents
-    prices = [LabeledPrice("1 Month Subscription", price)]
-    await context.bot.send_invoice(
-        chat_id=update.effective_user.id,
-        title=title,
-        description=description,
-        payload=payload,
-        provider_token=PAYMENT_PROVIDER_TOKEN,
-        currency=currency,
-        prices=prices,
-        start_parameter="subscribe-panda"
-    )
-
-async def subscribe_stars(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    title = "Panda AppStore Subscription"
-    description = "1-month premium subscription to Panda AppStore (digital service)."
-    payload = "panda-stars-subscription-001"
-    stars_price = 100  # Example: 100 Stars for 1 month
-
-    await context.bot.send_invoice(
-        chat_id=user_id,
-        title=title,
-        description=description,
-        payload=payload,
-        provider_token="",  # Leave empty for Stars
-        currency="XTR",     # XTR = Telegram Stars
-        prices=[LabeledPrice("1 Month Subscription", stars_price)],
-        start_parameter="subscribe-stars"
-    )
-
-# === USER PANEL: BUY REDEEM CODE ===
-async def show_user_panel(update, context):
-    plans = load_plans()
-    keyboard = [
-        [InlineKeyboardButton(f"📦 {plan['name']} ({plan['price_stars']}⭐/$ {plan['price_usd']})", callback_data=f"plan_{key}")]
-        for key, plan in plans.items()
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    text = "<b>🐼 Panda AppStore <u>USER MENU</u></b>\n<i>──────────────</i>\nChoose a plan to see details and payment options:"
-
-    if hasattr(update, 'callback_query') and update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
-    else:
-        await update.message.reply_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
-
-async def handle_user_buy_plan(update, context, plan_key):
-    plans = load_plans()
-    plan = plans[plan_key]
-    keyboard = [
-        [InlineKeyboardButton(f"Buy with Stars ({plan['price_stars']}⭐)", callback_data=f"pay_stars_{plan_key}")],
-        [InlineKeyboardButton("🔙 Back", callback_data="user_panel")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.callback_query.edit_message_text(
-        f"<b>📦 {plan['name']}</b>\nPay securely with Telegram Stars:",
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
-
-def sanitize_for_telegram_param(s):
-    # Only allow a-z, A-Z, 0-9, _ and -
-    return re.sub(r'[^a-zA-Z0-9_-]', '', s)
-
-async def handle_user_payment(update, context, plan_key, method):
-    plans = load_plans()
-    plan = plans[plan_key]
-    sanitized_plan_key = sanitize_for_telegram_param(plan_key)
-    if method == 'stars':
-        try:
-            await context.bot.send_invoice(
-                chat_id=update.effective_user.id,
-                title=f"📦 {plan['name']} Redeem Code",
-                description=f"Redeem code for {plan['name']} plan.",
-                payload=f"buy-{sanitized_plan_key}-stars",
-                provider_token="",  # Telegram Stars
-                currency="XTR",
-                prices=[LabeledPrice(f"📦 {plan['name']} Redeem Code", plan['price_stars'])],
-                start_parameter=f"buy-{sanitized_plan_key}-stars"
-            )
-        except Exception as e:
-            logger.error(f"[PAYMENT ERROR] Could not send invoice for plan {plan_key}: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            await update.callback_query.edit_message_text("❌ Error sending payment invoice. Please contact support.")
-    else:
-        await update.callback_query.edit_message_text("❌ Only Telegram Stars payment is supported.")
-
-# === CALLBACK HANDLER UPDATES ===
-# Add to admin_callback_handler and user_callback_handler as needed
-
-# Handler for receiving codes from admin
-async def handle_admin_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    plan_key = context.user_data.get('plan_key')
-    if not context.user_data.get('awaiting_codes'):
-        return
-    codes = set()
-    if update.message.document:
-        file = await update.message.document.get_file()
-        content = (await file.download_as_bytearray()).decode('utf-8')
-        codes = set(line.strip() for line in content.splitlines() if line.strip())
-    else:
-        codes = set(line.strip() for line in update.message.text.splitlines() if line.strip())
-    if plan_key:
-        existing = load_plan_codes(plan_key)
-        new_codes = codes - existing
-        all_codes = existing | new_codes
-        save_plan_codes(plan_key, all_codes)
-        await update.message.reply_text(f"✅ Added {len(new_codes)} new codes to {plan_key.upper()}. Total codes: {len(all_codes)}.")
-    else:
-        existing = load_redeem_codes()
-        new_codes = codes - existing
-        all_codes = existing | new_codes
-        save_redeem_codes(all_codes)
-        await update.message.reply_text(f"✅ Added {len(new_codes)} new codes. Total codes: {len(all_codes)}.")
-    context.user_data['awaiting_codes'] = False
-    context.user_data['plan_key'] = None
-
-# User callback handler for plan purchase
-async def user_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    logger.info(f"[DEBUG] user_callback_handler called with data: {data}")
-    if data == 'user_panel' or data.lower() == 'back' or data == '🔙 Back':
-        await show_user_panel(update, context)
-    elif data.startswith('plan_'):
-        plan_key = data.split('_', 1)[1]
-        await show_user_plan_detail(update, context, plan_key)
-    elif data.startswith('pay_stars_'):
-        plan_key = data.split('_', 2)[2]
-        await handle_user_payment(update, context, plan_key, 'stars')
-    elif data.startswith('other_payment_'):
-        plan_key = data.split('_', 2)[2]
-        plans = load_plans()
-        plan = plans[plan_key]
-        other_payment = plan.get('other_payment', 'No other payment info set.')
-        await update.callback_query.edit_message_text(
-            f"<b>Other Payment Method (Binance USDT)</b>\n\n{other_payment}",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"plan_{plan_key}")]])
-        )
-    elif data.startswith('view_codes_'):
-        rest = data[len('view_codes_'):]
-        if '_' in rest:
-            plan_key, page = rest.rsplit('_', 1)
-            try:
-                page = int(page)
-            except:
-                page = 0
-        else:
-            plan_key = rest
-            page = 0
-        await show_plan_codes_page(update, context, plan_key, page=page)
-    elif data.startswith('remove_code_'):
-        plan_key = data[len('remove_code_'):]
-        context.user_data['admin_action'] = f'remove_code_{plan_key}'
-        await query.message.reply_text(f"Please enter the code you want to remove from {plan_key.upper()}:")
-        await query.answer()
-
-# Payment success: deliver code from correct plan
-async def handle_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not getattr(update.message, 'successful_payment', None):
-        return
-    payload = update.message.successful_payment.invoice_payload
-    user_id = update.effective_user.id
-    # Parse payload: buy-<plan>-<method>
-    if payload.startswith('buy-'):
-        parts = payload.split('-')
-        plan_key = parts[1]
-        codes = load_plan_codes(plan_key)
-        if not codes:
-            await send_realistic_typing_and_message(context.bot, user_id, "❌ Sorry, no codes available for this plan. Please contact support.")
-            return
-        code = codes.pop()
-        save_plan_codes(plan_key, codes)
-        await send_realistic_typing_and_message(context.bot, user_id, f"✅ Thank you for your purchase! Your redeem code for {plan_key.upper()} is:\n<code>{code}</code>", parse_mode='HTML')
-        return
-    # Fallback: old logic
-    await update.message.reply_text(
-        "✅ Thank you for subscribing with Telegram Stars! Your premium access is now active."
-    )
-
-async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only allow admin users
-    logger.info(f"[DEBUG] admin_callback_handler called with data: {update.callback_query.data}")  # Added logging
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    query = update.callback_query
-    await query.answer()  # Always acknowledge callback at the start
-    data = query.data
-    logger.info(f"[DEBUG] Callback data received: {data}")
-    if data == 'admin_main':
-        await show_admin_panel(update, context)
-    elif data == 'admin_plans':
-        await show_plans_menu(update, context)
-    elif data.startswith('plan_') and not data.startswith('plan_codes_'):
-        plan_key = data.split('_', 1)[1]
-        await show_plan_detail_menu(update, context, plan_key)
-    elif data == 'add_plan':
-        context.user_data['add_plan_step'] = 'name'
-        await query.edit_message_text("Please enter the plan name (e.g., VIP, PREMIUM, etc.):")
-    elif data == 'cancel_add_plan':
-        context.user_data.pop('add_plan_step', None)
-        context.user_data.pop('add_plan_name', None)
-        context.user_data.pop('add_plan_desc', None)
-        context.user_data.pop('add_plan_stars', None)
-        context.user_data.pop('add_plan_usd', None)
-        await show_plans_menu(update, context)
-    elif data == 'confirm_add_plan':
-        name = context.user_data.get('add_plan_name')
-        desc = context.user_data.get('add_plan_desc')
-        stars = context.user_data.get('add_plan_stars')
-        usd = context.user_data.get('add_plan_usd')
-        plans = load_plans()
-        plan_key = name.lower().replace(' ', '_')
-        if plan_key in plans:
-            await query.edit_message_text(f"❌ Plan '{name}' already exists.")
-            await asyncio.sleep(1.5)
-            await show_plans_menu(update, context)
-            return
-        codes_file = f"codes_{plan_key}.txt"
-        plans[plan_key] = {
-            'name': name,
-            'details': desc,
-            'price_stars': int(stars),
-            'price_usd': float(usd),
-            'codes_file': codes_file
-        }
-        save_plans(plans)
-        with open(codes_file, 'w') as f:
-            pass
-        await query.edit_message_text(f"✅ Plan '{name}' added.")
-        context.user_data.pop('add_plan_step', None)
-        context.user_data.pop('add_plan_name', None)
-        context.user_data.pop('add_plan_desc', None)
-        context.user_data.pop('add_plan_stars', None)
-        context.user_data.pop('add_plan_usd', None)
-        await asyncio.sleep(1.5)
-        await show_plans_menu(update, context)
-    elif data.startswith('remove_plan_'):
-        plan_key = data[len('remove_plan_'):]
-        # Show Yes/No confirmation
-        confirm_keyboard = [
-            [InlineKeyboardButton("✅ Yes, remove", callback_data=f'confirm_remove_plan_{plan_key}'),
-             InlineKeyboardButton("❌ No, cancel", callback_data=f'plan_{plan_key}')]
-        ]
-        await query.edit_message_text(
-            f"Are you sure you want to remove plan '<b>{plan_key.upper()}</b>'?",
-            reply_markup=InlineKeyboardMarkup(confirm_keyboard),
-            parse_mode='HTML'
-        )
-        await query.answer()
-    elif data.startswith('confirm_remove_plan_'):
-        plan_key = data[len('confirm_remove_plan_'):]
-        plans = load_plans()
-        if plan_key in plans:
-            codes_file = plans[plan_key]['codes_file']
-            try:
-                del plans[plan_key]
-                save_plans(plans)
-                import os
-                if os.path.exists(codes_file):
-                    os.remove(codes_file)
-                await query.edit_message_text(f"✅ Plan '{plan_key.upper()}' removed.")
-                await asyncio.sleep(1.5)
-                await show_plans_menu(update, context)
-            except Exception as e:
-                await query.edit_message_text(f"❌ Error removing plan: {e}")
-                await asyncio.sleep(1.5)
-                await show_plans_menu(update, context)
-        else:
-            await query.edit_message_text(f"❌ Plan '{plan_key.upper()}' not found.")
-            await asyncio.sleep(1.5)
-            await show_plans_menu(update, context)
-    elif data.startswith('add_codes_'):
-        plan_key = data[len('add_codes_'):]
-        context.user_data['awaiting_codes'] = True
-        context.user_data['plan_key'] = plan_key
-        await query.message.reply_text(f"Please send the redeem codes for {plan_key.upper()} (one per line or as a .txt file).")
-        await query.answer()
-    elif data.startswith('view_codes_'):
-        rest = data[len('view_codes_'):]
-        if '_' in rest:
-            plan_key, page = rest.rsplit('_', 1)
-            try:
-                page = int(page)
-            except:
-                page = 0
-        else:
-            plan_key = rest
-            page = 0
-        await show_plan_codes_page(update, context, plan_key, page=page)
-    elif data.startswith('remove_code_'):
-        plan_key = data[len('remove_code_'):]
-        context.user_data['admin_action'] = f'remove_code_{plan_key}'
-        await query.message.reply_text(f"Please enter the code you want to remove from {plan_key.upper()}:")
-        await query.answer()
-    elif data == 'admin_subs':
-        await show_subs_menu(update, context)
-    elif data == 'admin_redeem':
-        await show_redeem_menu(update, context)
-    elif data == 'add_redeem_codes':
-        context.user_data['awaiting_codes'] = True
-        context.user_data['plan_key'] = None
-        await query.message.reply_text(
-            "Please send the redeem codes (one per line or as a .txt file)."
-        )
-        await query.answer()
-    elif data == 'view_redeem_codes':
-        await show_codes_page(update, context, page=0)
-    elif data.startswith('view_redeem_codes_'):
-        page = int(data.split('_')[-1])
-        await show_codes_page(update, context, page=page)
-    elif data == 'remove_redeem_code':
-        context.user_data['admin_action'] = 'remove_code'
-        await query.message.reply_text("Please enter the code you want to remove:")
-        await query.answer()
-    elif data == 'admin_set_price':
-        await show_set_price_menu(update, context)
-    elif data == 'admin_users':
-        await show_users_page(update, context, page=0)
-    elif data.startswith('users_page_'):
-        page = int(data.split('_')[-1])
-        await show_users_page(update, context, page=page)
-    elif data.startswith('user_details_'):
-        uid = data.split('_')[-1]
-        await show_user_details(update, context, uid)
-    elif data == 'admin_broadcast':
-        context.user_data['admin_action'] = 'broadcast'
-        await query.message.reply_text("Please enter the message you want to broadcast to all users:")
-        await query.answer()
-    elif data == 'admin_stats':
-        await show_stats_menu(update, context)
-    elif data == 'add_sub':
-        context.user_data['admin_action'] = 'add_sub'
-        await query.message.reply_text("Please enter the user ID or username to add a subscription:")
-        await query.answer()
-    elif data == 'remove_sub':
-        context.user_data['admin_action'] = 'remove_sub'
-        await query.message.reply_text("Please enter the user ID or username to remove a subscription:")
-        await query.answer()
-    elif data == 'admin_settings':
-        await show_settings_menu(update, context)
-    elif data == 'admin_view_files':
-        import os
-        try:
-            cwd = os.getcwd()
-            files = os.listdir('.')
-            file_list = '\n'.join(files)
-            escaped_file_list = html.escape(file_list)
-            keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data='admin_settings')]]
-            await query.edit_message_text(
-                f"<b>Current working directory:</b> {cwd}\n"
-                f"<b>Bot Directory Files:</b>\n<pre>{escaped_file_list}</pre>",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='HTML'
-            )
-        except Exception as e:
-            await query.edit_message_text(f"❌ Could not list files: {e}")
-        await query.answer()
-    elif data == 'admin_update_website_data':
-        # Show confirmation prompt
-        confirm_keyboard = [
-            [InlineKeyboardButton("✅ Yes, update", callback_data='admin_confirm_update_website_data'),
-             InlineKeyboardButton("⬅️ Back", callback_data='admin_settings')]
-        ]
-        await query.edit_message_text(
-            "Are you sure you want to update website data from <a href='https://cpanda.app'>cpanda.app</a>?",
-            reply_markup=InlineKeyboardMarkup(confirm_keyboard),
-            parse_mode='HTML'
-        )
-        await query.answer()
-    elif data == 'admin_confirm_update_website_data':
-        import subprocess
-        await query.answer()  # Acknowledge immediately, no popup
-        await query.edit_message_text("🔄 Starting update...", parse_mode='HTML')
-        try:
-            subprocess.run(['python', 'cpanda_crawler.py'], check=True)
-            keyboard = [[InlineKeyboardButton("Back to Settings", callback_data='admin_settings')]]
-            await query.edit_message_text(
-                "✅ Update complete!\n\nTap below to return to Settings.",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='HTML'
-            )
-        except Exception as e:
-            keyboard = [[InlineKeyboardButton("Back to Settings", callback_data='admin_settings')]]
-            await query.edit_message_text(
-                f"❌ Failed to update website data: {e}\n\nTap below to return to Settings.",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='HTML'
-            )
-    elif data.startswith('edit_details_'):
-        plan_key = data[len('edit_details_'):]
-        context.user_data['edit_plan_details'] = plan_key
-        await query.message.reply_text(f"Send the new details for {plan_key.upper()}:")
-        await query.answer()
-    elif data.startswith('edit_other_payment_'):
-        plan_key = data[len('edit_other_payment_'):]
-        context.user_data['edit_plan_other_payment'] = plan_key
-        await query.message.reply_text(f"Send the new Binance USDT or other payment info for {plan_key.upper()}:")
-        await query.answer()
-
-# === Rate Limiting ===
-class RateLimiter:
-    def __init__(self, max_requests: int, time_window: int):
-        self.max_requests = max_requests
-        self.time_window = time_window
-        self.requests: Dict[int, list] = defaultdict(list)
-    
-    def is_rate_limited(self, user_id: int) -> bool:
-        now = time.time()
-        # Clean old requests
-        self.requests[user_id] = [req_time for req_time in self.requests[user_id] 
-                                if now - req_time < self.time_window]
-        # Check if user has exceeded rate limit
-        if len(self.requests[user_id]) >= self.max_requests:
-            return True
-        # Add new request
-        self.requests[user_id].append(now)
+        logger.error(f"Error saving {filename}: {e}")
         return False
 
-# === User Session Management ===
-class UserSession:
-    def __init__(self, user_id: int, username: str, name: str):
-        self.user_id = user_id
-        self.username = username
-        self.name = name
-        self.created_at = datetime.now(LOCAL_TZ)
-        self.last_active = datetime.now(LOCAL_TZ)
-        self.message_count = 0
-        self.is_subscribed = False
-        self.subscription_expiry: Optional[datetime] = None
-    
-    def update_activity(self):
-        self.last_active = datetime.now(LOCAL_TZ)
-        self.message_count += 1
-    
-    def to_dict(self) -> dict:
-        return {
-            'user_id': self.user_id,
-            'username': self.username,
-            'name': self.name,
-            'created_at': self.created_at.isoformat(),
-            'last_active': self.last_active.isoformat(),
-            'message_count': self.message_count,
-            'is_subscribed': self.is_subscribed,
-            'subscription_expiry': self.subscription_expiry.isoformat() if self.subscription_expiry else None
-        }
-    
-    @classmethod
-    def from_dict(cls, data: dict) -> 'UserSession':
-        session = cls(
-            user_id=data['user_id'],
-            username=data['username'],
-            name=data['name']
-        )
-        session.created_at = datetime.fromisoformat(data['created_at'])
-        session.last_active = datetime.fromisoformat(data['last_active'])
-        session.message_count = data['message_count']
-        session.is_subscribed = data['is_subscribed']
-        if data['subscription_expiry']:
-            session.subscription_expiry = datetime.fromisoformat(data['subscription_expiry'])
-        return session
+def is_admin(user_id: int) -> bool:
+    """Check if user is admin"""
+    return user_id in ADMIN_IDS
 
-class SessionManager:
-    def __init__(self):
-        self.sessions: Dict[int, UserSession] = {}
-        self.load_sessions()
+def is_admin_actively_responding(user_id: int) -> bool:
+    """Check if admin is actively responding to this user"""
+    admin_active = load_json_file('data/admin_active.json', {})
+    user_str = str(user_id)
     
-    def load_sessions(self):
-        if os.path.exists('user_sessions.json'):
-            try:
-                with open('user_sessions.json', 'r') as f:
-                    data = json.load(f)
-                    self.sessions = {
-                        int(uid): UserSession.from_dict(session_data)
-                        for uid, session_data in data.items()
-                    }
-            except Exception as e:
-                logger.error(f"Error loading sessions: {e}")
-    
-    def save_sessions(self):
-        try:
-            with open('user_sessions.json', 'w') as f:
-                json.dump(
-                    {str(uid): session.to_dict() for uid, session in self.sessions.items()},
-                    f,
-                    indent=2
-                )
-        except Exception as e:
-            logger.error(f"Error saving sessions: {e}")
-    
-    def get_or_create_session(self, user_id: int, username: str, name: str) -> UserSession:
-        if user_id not in self.sessions:
-            self.sessions[user_id] = UserSession(user_id, username, name)
-            self.save_sessions()
-        return self.sessions[user_id]
-    
-    def update_session(self, user_id: int):
-        if user_id in self.sessions:
-            self.sessions[user_id].update_activity()
-            self.save_sessions()
-    
-    def cleanup_inactive_sessions(self, days: int = 30):
-        now = datetime.now(LOCAL_TZ)
-        inactive_sessions = [
-            uid for uid, session in self.sessions.items()
-            if (now - session.last_active).days > days
-        ]
-        for uid in inactive_sessions:
-            del self.sessions[uid]
-        if inactive_sessions:
-            self.save_sessions()
-            logger.info(f"Cleaned up {len(inactive_sessions)} inactive sessions")
-
-# === Conversation Cleanup ===
-class ConversationManager:
-    def __init__(self, max_history_age_days: int = 30):
-        self.max_history_age_days = max_history_age_days
-    
-    def cleanup_old_conversations(self):
-        now = datetime.now(LOCAL_TZ)
-        cutoff_date = now - timedelta(days=self.max_history_age_days)
+    if user_str in admin_active:
+        last_activity = admin_active[user_str].get('last_activity', 0)
+        current_time = time.time()
         
-        # Load current histories
-        histories = load_histories()
-        cleaned_histories = {}
-        
-        for user_id, messages in histories.items():
-            # Keep only messages newer than cutoff date
-            cleaned_messages = [
-                msg for msg in messages
-                if datetime.fromisoformat(msg.get('timestamp', '2000-01-01')) > cutoff_date
-            ]
-            if cleaned_messages:
-                cleaned_histories[user_id] = cleaned_messages
-        
-        # Save cleaned histories
-        save_histories(cleaned_histories)
-        logger.info(f"Cleaned up old conversations. Kept {len(cleaned_histories)} active conversations")
+        # Admin is considered active if they responded within the last 20 seconds
+        if current_time - last_activity < 20:
+            return True
+        else:
+            # Remove expired admin activity
+            del admin_active[user_str]
+            save_json_file('data/admin_active.json', admin_active)
+            return False
+    
+    return False
 
-# Initialize managers
-rate_limiter = RateLimiter(max_requests=20, time_window=60)  # 20 requests per minute
-session_manager = SessionManager()
-conversation_manager = ConversationManager()
-
-# Handler for reply keyboard 'Buy Now' button
-async def handle_buy_now_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    plans = load_plans()
-    if not plans:
-        await update.message.reply_text("No plans available.")
-        return
-    # Use the first plan as default
-    first_key = next(iter(plans))
-    await handle_user_payment(update, context, first_key, 'stars')
-
-def load_subscription_price():
-    if not os.path.exists(SUBSCRIPTION_PRICE_FILE):
-        return 2500  # Default price in Stars
-    with open(SUBSCRIPTION_PRICE_FILE, "r") as f:
-        try:
-            return int(f.read().strip())
-        except:
-            return 2500
-
-async def show_set_price_menu(update, context):
-    price = load_subscription_price()
-    approx_usd = round(price * 0.016, 2)  # 1 Star ≈ $0.016 (example rate)
-    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='admin_main')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    text = (
-        f"💸 <b>Set Subscription Price</b>\n\nCurrent price: <b>{price} Stars</b> (≈ ${approx_usd})\n\nSend a new price in Stars to update."
-    )
-    if hasattr(update, 'callback_query') and update.callback_query:
-        await update.callback_query.edit_message_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
-    else:
-        await update.message.reply_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
-    context.user_data['admin_action'] = 'set_price'
-
-def save_subscription_price(price):
-    with open(SUBSCRIPTION_PRICE_FILE, "w") as f:
-        f.write(str(price))
-
-def ensure_required_files():
-    required_files = {
-        "active_threads.json": {},
-        "codes_test.txt": "",
-        "conversation_history.json": {},
-        "cpanda_pages.txt": "",
-        "plans.json": {},
-        "redeem_codes_premium.txt": "",
-        "redeem_codes.txt": "",
-        "subscription_price.txt": "2500",  # Default price
-        "user_sessions.json": {},
+def mark_admin_active(user_id: int, admin_id: int):
+    """Mark admin as actively responding to user"""
+    admin_active = load_json_file('data/admin_active.json', {})
+    admin_active[str(user_id)] = {
+        'admin_id': admin_id,
+        'last_activity': time.time(),
+        'user_last_message': admin_active.get(str(user_id), {}).get('user_last_message', time.time())
     }
-    for filename, default_content in required_files.items():
-        if not os.path.exists(filename):
-            with open(filename, "w") as f:
-                if filename.endswith('.json'):
-                    import json
-                    json.dump(default_content, f, indent=2)
-                else:
-                    f.write(str(default_content))
+    save_json_file('data/admin_active.json', admin_active)
 
-# Call this at the top after loading environment
-ensure_required_files()
-
-def load_users_info():
-    if os.path.exists("users_info.json"):
-        with open("users_info.json", "r") as f:
-            return json.load(f)
-    return {}
-
-def save_users_info(users_info):
-    with open("users_info.json", "w") as f:
-        json.dump(users_info, f, indent=2)
-
-# Load users_info at startup
-users_info_loaded = load_users_info()
-
-# Settings submenu
-async def show_settings_menu(update, context):
-    keyboard = [
-        [InlineKeyboardButton("📁 View Bot Files", callback_data='admin_view_files')],
-        [InlineKeyboardButton("🔄 Update Website Data", callback_data='admin_update_website_data')],
-        [InlineKeyboardButton("⬅️ Back", callback_data='admin_main')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    text = "<b>⚙️ Settings</b>\n<i>──────────────</i>\nChoose an option:"
-    if hasattr(update, 'callback_query') and update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+def update_user_last_message(user_id: int):
+    """Update timestamp when user sends a message"""
+    admin_active = load_json_file('data/admin_active.json', {})
+    user_str = str(user_id)
+    
+    if user_str in admin_active:
+        admin_active[user_str]['user_last_message'] = time.time()
     else:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        admin_active[user_str] = {
+            'admin_id': None,
+            'last_activity': 0,
+            'user_last_message': time.time()
+        }
+    save_json_file('data/admin_active.json', admin_active)
 
-# 5. Add a new function to show plan details and payment options to the user
-async def show_user_plan_detail(update, context, plan_key):
-    plans = load_plans()
-    plan = plans[plan_key]
-    details = plan.get('details', 'No details provided.')
-    other_payment = plan.get('other_payment', None)
-    text = (
-        f"<b>📦 {plan['name']}</b>\n"
-        f"Price: <b>{plan['price_stars']}⭐</b> / <b>${plan['price_usd']}</b>\n"
-        f"<i>──────────────</i>\n"
-        f"{details}\n"
-    )
-    keyboard = [
-        [InlineKeyboardButton(f"Buy with Stars ({plan['price_stars']}⭐)", callback_data=f"pay_stars_{plan_key}")]
+def should_ai_respond_after_timeout(user_id: int) -> bool:
+    """Check if AI should respond after 20 seconds of admin inactivity"""
+    admin_active = load_json_file('data/admin_active.json', {})
+    user_str = str(user_id)
+    
+    if user_str in admin_active:
+        user_last_message = admin_active[user_str].get('user_last_message', 0)
+        admin_last_activity = admin_active[user_str].get('last_activity', 0)
+        current_time = time.time()
+        
+        # If admin was active but hasn't responded to user's last message within 20 seconds
+        if (admin_last_activity > 0 and 
+            user_last_message > admin_last_activity and 
+            current_time - user_last_message >= 20):
+            # Remove admin activity and let AI take over
+            del admin_active[user_str]
+            save_json_file('data/admin_active.json', admin_active)
+            return True
+    
+    return False
+
+async def forward_user_message_to_admin_thread(context, user_id: int, username: str, message_text: str):
+    """Forward user message to admin thread when admin is actively handling"""
+    try:
+        thread_id = await get_or_create_thread_id(context, user_id, username)
+        if thread_id:
+            await context.bot.send_message(
+                chat_id=GROUP_ID,
+                message_thread_id=thread_id,
+                text=f"💬 {username}: {message_text}"
+            )
+            logger.info(f"Forwarded user message to admin thread {thread_id}")
+    except Exception as e:
+        logger.error(f"Error forwarding user message to admin thread: {e}")
+
+def detect_free_content_request(message: str) -> bool:
+    """Detect if user is asking for free apps, games, or subscriptions"""
+    free_keywords = [
+        'free', 'gratis', 'gratuit', 'kostenlos', 'gratuito',
+        'trial', 'demo', 'test',
+        'without pay', 'no cost', 'no money',
+        'cracked', 'hack', 'mod',
+        'pirate', 'illegal', 'stolen'
     ]
-    if other_payment:
-        keyboard.append([InlineKeyboardButton("Other Payment (Binance USDT)", callback_data=f"other_payment_{plan_key}")])
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="user_panel")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.callback_query.edit_message_text(
-        text,
-        reply_markup=reply_markup,
-        parse_mode='HTML'
+    
+    game_keywords = [
+        'carx', 'car x', 'car parking', 'parking multiplayer',
+        'pubg', 'fortnite', 'minecraft', 'roblox',
+        'clash', 'candy crush', 'subway surfers'
+    ]
+    
+    message_lower = message.lower()
+    
+    # Check for explicit free requests
+    for keyword in free_keywords:
+        if keyword in message_lower:
+            return True
+    
+    # Check for game requests that might imply free access
+    for game in game_keywords:
+        if game in message_lower and any(free_word in message_lower for free_word in ['free', 'crack', 'mod', 'hack']):
+            return True
+    
+    return False
+
+def detect_carx_street_request(message: str) -> bool:
+    """Specifically detect CarX Street requests"""
+    carx_keywords = ['carx', 'car x', 'carx street', 'car x street']
+    message_lower = message.lower()
+    return any(keyword in message_lower for keyword in carx_keywords)
+
+def calculate_message_similarity(msg1: str, msg2: str) -> float:
+    """Calculate similarity between two messages"""
+    if not msg1 or not msg2:
+        return 0.0
+    
+    # Simple similarity based on common words
+    words1 = set(msg1.lower().split())
+    words2 = set(msg2.lower().split())
+    
+    if not words1 or not words2:
+        return 0.0
+    
+    intersection = len(words1.intersection(words2))
+    union = len(words1.union(words2))
+    
+    return intersection / union if union > 0 else 0.0
+
+def check_word_repetition(user_id: int, message: str) -> dict:
+    """Check if user is repeating the same word multiple times"""
+    word_tracking = load_json_file('data/user_word_tracking.json', {})
+    user_str = str(user_id)
+    current_time = time.time()
+    
+    if user_str not in word_tracking:
+        word_tracking[user_str] = {'word_counts': {}, 'last_reset': current_time}
+    
+    user_data = word_tracking[user_str]
+    
+    # Reset counts every hour
+    if current_time - user_data.get('last_reset', 0) > 3600:
+        user_data['word_counts'] = {}
+        user_data['last_reset'] = current_time
+    
+    # Count word occurrences in message
+    words = message.lower().split()
+    for word in words:
+        if len(word) > 2:  # Only track words longer than 2 characters
+            user_data['word_counts'][word] = user_data['word_counts'].get(word, 0) + 1
+    
+    # Check for excessive repetition
+    max_count = 0
+    repeated_word = None
+    for word, count in user_data['word_counts'].items():
+        if count > max_count:
+            max_count = count
+            repeated_word = word
+    
+    word_tracking[user_str] = user_data
+    save_json_file('data/user_word_tracking.json', word_tracking)
+    
+    return {
+        'max_count': max_count,
+        'repeated_word': repeated_word,
+        'needs_warning': max_count >= 3,
+        'needs_ban': max_count >= 5
+    }
+
+def is_spam_message(user_id: int, message: str) -> bool:
+    """Check if message should be considered spam"""
+    spam_tracking = load_json_file('data/user_spam_tracking.json', {})
+    user_str = str(user_id)
+    current_time = time.time()
+    
+    if user_str not in spam_tracking:
+        spam_tracking[user_str] = {'messages': [], 'last_message': ''}
+    
+    user_data = spam_tracking[user_str]
+    
+    # Remove old messages outside the spam window
+    user_data['messages'] = [
+        msg_time for msg_time in user_data['messages']
+        if current_time - msg_time < SPAM_WINDOW
+    ]
+    
+    # Check message frequency
+    if len(user_data['messages']) >= SPAM_THRESHOLD:
+        return True
+    
+    # Check message similarity
+    if user_data.get('last_message'):
+        similarity = calculate_message_similarity(message, user_data['last_message'])
+        if similarity > SIMILARITY_THRESHOLD and len(user_data['messages']) >= 2:
+            return True
+    
+    # Check minimum interval between messages
+    if user_data['messages'] and current_time - user_data['messages'][-1] < 2:
+        return True
+    
+    # Update tracking
+    user_data['messages'].append(current_time)
+    user_data['last_message'] = message
+    spam_tracking[user_str] = user_data
+    save_json_file('data/user_spam_tracking.json', spam_tracking)
+    
+    return False
+
+def get_user_ban_history(user_id: int) -> dict:
+    """Get user's ban history for progressive penalties"""
+    ban_history = load_json_file('data/user_ban_history.json', {})
+    user_str = str(user_id)
+    
+    if user_str not in ban_history:
+        ban_history[user_str] = {
+            'ban_count': 0,
+            'last_ban': 0,
+            'permanent_ban_requested': False
+        }
+        save_json_file('data/user_ban_history.json', ban_history)
+    
+    return ban_history[user_str]
+
+def calculate_ban_duration(user_id: int) -> dict:
+    """Calculate ban duration based on user's history"""
+    history = get_user_ban_history(user_id)
+    ban_count = history['ban_count']
+    
+    if ban_count == 0:
+        # First offense: 30 minutes
+        return {
+            'duration': 1800,  # 30 minutes
+            'duration_text': '30 minutes',
+            'ban_type': 'temporary'
+        }
+    elif ban_count == 1:
+        # Second offense: 1 hour
+        return {
+            'duration': 3600,  # 1 hour
+            'duration_text': '1 hour',
+            'ban_type': 'temporary'
+        }
+    elif ban_count == 2:
+        # Third offense: 24 hours
+        return {
+            'duration': 86400,  # 24 hours
+            'duration_text': '24 hours',
+            'ban_type': 'temporary'
+        }
+    else:
+        # Fourth+ offense: Permanent (requires admin approval)
+        return {
+            'duration': 0,  # Permanent
+            'duration_text': 'permanent',
+            'ban_type': 'permanent_pending'
+        }
+
+def ban_user_progressive(user_id: int, username: str = None, reason: str = 'Spam/Abuse') -> dict:
+    """Ban user with progressive penalties"""
+    banned_users = load_json_file('data/banned_users.json', {})
+    ban_history = load_json_file('data/user_ban_history.json', {})
+    
+    user_str = str(user_id)
+    current_time = time.time()
+    
+    # Get ban duration
+    ban_info = calculate_ban_duration(user_id)
+    
+    # Update ban history
+    if user_str not in ban_history:
+        ban_history[user_str] = {'ban_count': 0, 'last_ban': 0, 'permanent_ban_requested': False}
+    
+    ban_history[user_str]['ban_count'] += 1
+    ban_history[user_str]['last_ban'] = current_time
+    
+    if ban_info['ban_type'] == 'permanent_pending':
+        ban_history[user_str]['permanent_ban_requested'] = True
+    
+    save_json_file('data/user_ban_history.json', ban_history)
+    
+    # Apply ban
+    banned_users[user_str] = {
+        'banned_at': current_time,
+        'ban_type': ban_info['ban_type'],
+        'duration': ban_info['duration'],
+        'reason': reason,
+        'username': username or f'User{user_id}',
+        'ban_count': ban_history[user_str]['ban_count']
+    }
+    
+    save_json_file('data/banned_users.json', banned_users)
+    
+    return {
+        'success': True,
+        'duration_text': ban_info['duration_text'],
+        'ban_type': ban_info['ban_type'],
+        'ban_count': ban_history[user_str]['ban_count']
+    }
+
+def send_warning_message(user_id: int, repeated_word: str, count: int) -> str:
+    """Generate warning message for word repetition"""
+    return f"⚠️ Warning: You've repeated the word '{repeated_word}' {count} times. Please avoid excessive repetition or you may be temporarily banned."
+
+def ban_user_for_spam(user_id: int, username: str = None) -> bool:
+    """Ban user using progressive system"""
+    result = ban_user_progressive(user_id, username, 'Automatic spam detection')
+    logger.info(f"Progressive ban applied to user {user_id} ({username}): {result['duration_text']}")
+    return result['success']
+
+async def calculate_typing_delay(message_length: int) -> float:
+    """Calculate realistic typing delay based on message length"""
+    base_delay = 3.0  # Base thinking time
+    typing_speed = random.uniform(3, 5)  # Characters per second
+    typing_time = message_length / typing_speed
+    
+    # Add some randomness for natural feel
+    randomness = random.uniform(0.5, 2.0)
+    
+    total_delay = base_delay + typing_time + randomness
+    return min(max(total_delay, 3.0), 15.0)  # Between 3-15 seconds
+
+async def send_realistic_typing(context, chat_id: int, message: str):
+    """Send realistic typing indicator based on message length"""
+    try:
+        delay = await calculate_typing_delay(len(message))
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        await asyncio.sleep(delay)
+    except Exception as e:
+        logger.error(f"Error sending typing indicator: {e}")
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command with intelligent menu routing"""
+    user_id = update.effective_user.id
+    username = update.effective_user.first_name or update.effective_user.username or f"User{user_id}"
+    
+    # Check if user is banned (skip admins)
+    if not is_admin(user_id):
+        banned_users = load_json_file('data/banned_users.json', {})
+        if str(user_id) in banned_users:
+            await update.message.reply_text("🚫 You are banned from using this bot. Contact support if you believe this is an error.")
+            return
+    
+    # Route to appropriate menu
+    if is_admin(user_id):
+        await show_admin_main_menu(update, context)
+    else:
+        await show_user_main_menu(update, context, username)
+
+async def show_user_main_menu(update, context, username=None):
+    """Show main menu for regular users"""
+    pricing_config = load_json_file('data/pricing_config.json', {'usd_amount': 35.0, 'stars_amount': 2500})
+    usd_amount = pricing_config.get('usd_amount', 35)
+    stars_amount = pricing_config.get('stars_amount', 2500)
+    
+    welcome_text = f"""🎯 Transform Your iPhone Experience - No Jailbreak Required!
+
+Unlock premium features, unlimited resources, and exclusive content that's normally restricted or paid.
+
+💎 Premium Plan - ONE YEAR Access
+• CarX Street: Unlimited money & all cars unlocked
+• Car Parking Multiplayer: All vehicles & unlimited coins  
+• Spotify++: Premium features without subscription
+• YouTube++: Background play, downloads & ad-free
+• Instagram++: Download photos, videos & stories
+• 200+ Premium Apps & Games included
+
+✨ What You Get:
+• Device-specific optimization for your iPhone
+• Ad-free experience across all apps
+• Hassle-free installation process  
+• Supercharged social media features
+• 3-month revoke guarantee
+• Dedicated expert support
+
+💰 Price: ${usd_amount} USD or {stars_amount} Stars
+🔗 Full app collection: https://cpanda.app/page/ios-subscriptions
+
+Ready to upgrade your iPhone experience?"""
+    
+    keyboard = [
+        [InlineKeyboardButton("💎 Buy Premium Plan", callback_data="show_plans")],
+        [InlineKeyboardButton("🎁 Panda AppStore Free", url="https://t.me/PandaStoreFreebot")]
+    ]
+    
+    if hasattr(update, 'message') and update.message:
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            disable_web_page_preview=True
+        )
+    elif hasattr(update, 'edit_message_text'):
+        await update.edit_message_text(
+            welcome_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            disable_web_page_preview=True
+        )
+
+async def show_admin_main_menu(update, context):
+    """Show main menu for admin users with real-time dashboard"""
+    try:
+        # Get real-time statistics
+        conversation_histories = load_json_file('data/conversation_histories.json', {})
+        banned_users = load_json_file('data/banned_users.json', {})
+        redeem_codes = load_json_file('data/redeem_codes.json', {})
+        pricing_config = load_json_file('data/pricing_config.json', {'usd_amount': 35.0, 'stars_amount': 2500})
+        
+        total_users = len(conversation_histories) if isinstance(conversation_histories, dict) else 0
+        banned_count = len(banned_users) if isinstance(banned_users, dict) else 0
+        active_users = total_users - banned_count
+        
+        active_codes = 0
+        used_codes = 0
+        if isinstance(redeem_codes, dict):
+            for code_info in redeem_codes.values():
+                if isinstance(code_info, dict):
+                    if code_info.get('status') == 'active':
+                        active_codes += 1
+                    elif code_info.get('status') == 'used':
+                        used_codes += 1
+        
+        revenue = used_codes * pricing_config.get('usd_amount', 35.0)
+        
+        # System stats
+        cpu_percent = psutil.cpu_percent()
+        memory = psutil.virtual_memory()
+        
+        admin_text = f"""🛠️ Admin Control Panel
+
+📊 Real-Time Dashboard
+┌─ Total Users: {total_users:,}
+├─ Active Users: {active_users:,}
+├─ Banned Users: {banned_count}
+├─ Active Codes: {active_codes}
+├─ Used Codes: {used_codes}
+├─ Revenue: ${revenue:,.0f}
+├─ CPU Usage: {cpu_percent:.1f}%
+└─ Memory: {memory.percent:.1f}%
+
+🎛️ Management Tools"""
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("🎫 Redeem Codes", callback_data="admin_redeem_codes"),
+                InlineKeyboardButton("👥 User Management", callback_data="admin_users")
+            ],
+            [
+                InlineKeyboardButton("📢 Broadcasts", callback_data="admin_broadcasts"),
+                InlineKeyboardButton("💰 Payment Monitor", callback_data="admin_payments")
+            ],
+            [
+                InlineKeyboardButton("💵 Pricing Config", callback_data="admin_pricing_config"),
+                InlineKeyboardButton("📊 System Status", callback_data="admin_system_status")
+            ]
+        ]
+        
+        await update.message.reply_text(admin_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        
+    except Exception as e:
+        logger.error(f"Error showing admin menu: {e}")
+        await update.message.reply_text("Error loading admin panel. Please try again.")
+
+async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all callback queries with comprehensive routing"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    user_id = query.from_user.id
+    
+    # Check if user is banned (skip admins)
+    if not is_admin(user_id):
+        banned_users = load_json_file('data/banned_users.json', {})
+        if str(user_id) in banned_users:
+            await query.edit_message_text("🚫 You are banned from using this bot. Contact support if you believe this is an error.")
+            return
+    
+    try:
+        # Route based on user type and callback data
+        if is_admin(user_id):
+            await handle_admin_callbacks(query, data, context)
+        else:
+            await handle_user_callbacks(query, data, context)
+            
+    except Exception as e:
+        logger.error(f"Callback error: {e}")
+        await query.edit_message_text(
+            "An error occurred. Please try again or contact support.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="start")]])
+        )
+
+async def handle_crypto_payment(query, context):
+    """Handle cryptocurrency payment through OxaPay"""
+    user_id = query.from_user.id
+    
+    if not OXAPAY_API_KEY:
+        await query.edit_message_text(
+            "❌ Cryptocurrency Payment Not Available\n\nPayment system is not configured. Please try Stars payment or contact support.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Plans", callback_data="show_plans")]])
+        )
+        return
+    
+    # Get current pricing
+    pricing_config = load_json_file('data/pricing_config.json', {'usd_amount': 35.0})
+    amount = float(pricing_config.get('usd_amount', 35.0))
+    
+    # Create OxaPay payment
+    try:
+        order_id = f"PANDA_{user_id}_{int(time.time())}"
+        
+        # Store payment tracking
+        payment_tracking = load_json_file('data/payment_tracking.json', {})
+        payment_tracking[order_id] = {
+            'user_id': user_id,
+            'amount': amount,
+            'timestamp': time.time(),
+            'status': 'pending'
+        }
+        save_json_file('data/payment_tracking.json', payment_tracking)
+        
+        # Create payment via OxaPay
+        url = "https://api.oxapay.com/merchants/request"
+        payload = {
+            'merchant': OXAPAY_API_KEY,
+            'amount': float(amount),
+            'currency': 'USD',
+            'lifeTime': 30,
+            'feePaidByPayer': 1,
+            'underPaidCover': 5,
+            'description': 'Panda AppStore Premium',
+            'orderId': order_id
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    if result.get('result') == 100 and result.get('payLink'):
+                        crypto_text = f"""💳 Cryptocurrency Payment - ${amount:.0f} USD
+
+🎯 Premium Plan Access
+
+Payment Link:
+{result['payLink']}
+
+Supported Cryptocurrencies:
+• Bitcoin (BTC)
+• Ethereum (ETH) 
+• Tether (USDT)
+• Litecoin (LTC)
+• And many more...
+
+Payment Process:
+1. Click the payment link above
+2. Select your preferred cryptocurrency
+3. Complete the payment for ${amount:.0f}
+4. Payment verified automatically
+5. Receive redeem code after admin approval
+
+Important:
+• Payment expires in 30 minutes
+• Use exact amount shown
+• Admin will manually send code after verification"""
+                        
+                        keyboard = [
+                            [InlineKeyboardButton(f"💳 Pay ${amount:.0f} with Crypto", url=result['payLink'])],
+                            [InlineKeyboardButton("📞 Contact Support", callback_data="contact_support")],
+                            [InlineKeyboardButton("🔙 Back to Plans", callback_data="show_plans")]
+                        ]
+                        
+                        await query.edit_message_text(
+                            crypto_text,
+                            reply_markup=InlineKeyboardMarkup(keyboard)
+                        )
+                        return
+                
+        # Fallback to manual payment
+        crypto_text = f"""💳 Manual Cryptocurrency Payment - ${amount:.0f} USD
+
+Send exactly ${amount:.0f} worth of cryptocurrency to:
+
+Bitcoin (BTC): 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa
+Ethereum (ETH): 0x742d35Cc6532C4532532C45329b3a
+USDT (TRC20): TQn9Y2khEsLMJ4puFgK6k6GVA3q
+
+After payment:
+1. Take screenshot of transaction
+2. Send screenshot to bot
+3. Admin will verify and send code within 24 hours
+
+⚠️ Important: Include your User ID {user_id} in transaction memo if possible"""
+        
+        keyboard = [
+            [InlineKeyboardButton("📸 Submit Payment Screenshot", callback_data="submit_crypto_proof")],
+            [InlineKeyboardButton("📞 Contact Support", callback_data="contact_support")],
+            [InlineKeyboardButton("🔙 Back to Plans", callback_data="show_plans")]
+        ]
+        
+        await query.edit_message_text(
+            crypto_text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+    except Exception as e:
+        logger.error(f"Crypto payment error: {e}")
+        await query.edit_message_text(
+            "❌ Payment system temporarily unavailable. Please try again later or contact support.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Plans", callback_data="show_plans")]])
+        )
+
+async def handle_stars_payment(query, context):
+    """Handle Telegram Stars payment"""
+    user_id = query.from_user.id
+    
+    # Get configured Stars post URL
+    stars_config = load_json_file('data/stars_config.json', {})
+    stars_post_url = stars_config.get('paid_post_url')
+    
+    if not stars_post_url:
+        await query.edit_message_text(
+            "❌ Stars Payment Not Available\n\nAdmin has not configured the Stars payment post yet. Please try cryptocurrency payment or contact support.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Plans", callback_data="show_plans")]])
+        )
+        return
+    
+    # Get current pricing
+    pricing_config = load_json_file('data/pricing_config.json', {'stars_amount': 2500})
+    stars_amount = pricing_config.get('stars_amount', 2500)
+    
+    stars_text = f"""⭐ Telegram Stars Payment - {stars_amount} Stars
+
+Payment Process:
+1. Click the paid post link below
+2. Pay {stars_amount} Telegram Stars to unlock the post
+3. Take a screenshot of the unlocked post
+4. Send screenshot here for admin verification
+5. Admin will verify and send your redeem code
+
+Paid Post Link:
+{stars_post_url}
+
+Important:
+• Must take clear screenshot showing payment completed
+• Admin verifies within 24 hours
+• Valid redeem code sent after verification
+• ONE YEAR Premium Access"""
+    
+    keyboard = [
+        [InlineKeyboardButton(f"⭐ Pay {stars_amount} Stars", url=stars_post_url)],
+        [InlineKeyboardButton("📸 Submit Screenshot", callback_data="submit_stars_proof")],
+        [InlineKeyboardButton("🔙 Back to Plans", callback_data="show_plans")]
+    ]
+    
+    await query.edit_message_text(
+        stars_text,
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
+async def handle_user_callbacks(query, data, context):
+    """Handle user menu callbacks"""
+    if data == "crypto_payment":
+        await handle_crypto_payment(query, context)
+        
+    elif data == "stars_payment":
+        await handle_stars_payment(query, context)
+        
+    elif data == "submit_stars_proof":
+        context.user_data['awaiting_stars_screenshot'] = True
+        await query.edit_message_text(
+            "📸 Submit Stars Payment Screenshot\n\nPlease send a clear screenshot showing your Stars payment completion. This will be forwarded to admin for verification.\n\nAdmin will review and send your redeem code within 24 hours.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Payment", callback_data="stars_payment")]])
+        )
+        
+    elif data == "submit_crypto_proof":
+        context.user_data['awaiting_crypto_screenshot'] = True
+        await query.edit_message_text(
+            "📸 Submit Crypto Payment Screenshot\n\nPlease send a clear screenshot showing your cryptocurrency transaction. Include transaction hash if visible.\n\nAdmin will review and send your redeem code within 24 hours.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Payment", callback_data="crypto_payment")]])
+        )
+        
+    elif data == "contact_support":
+        await query.edit_message_text(
+            "📞 Contact Support\n\nIf you need help with payments or have questions, please describe your issue and an admin will assist you.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Plans", callback_data="show_plans")]])
+        )
+        
+    elif data == "start":
+        # Handle back to main menu
+        pricing_config = load_json_file('data/pricing_config.json', {'usd_amount': 35.0, 'stars_amount': 2500})
+        usd_amount = pricing_config.get('usd_amount', 35)
+        stars_amount = pricing_config.get('stars_amount', 2500)
+        username = query.from_user.first_name or "User"
+        
+        welcome_text = f"""🎯 Transform Your iPhone Experience - No Jailbreak Required!
+
+Unlock premium features, unlimited resources, and exclusive content that's normally restricted or paid.
+
+💎 Premium Plan - ONE YEAR Access
+• CarX Street: Unlimited money & all cars unlocked
+• Car Parking Multiplayer: All vehicles & unlimited coins  
+• Spotify++: Premium features without subscription
+• YouTube++: Background play, downloads & ad-free
+• Instagram++: Download photos, videos & stories
+• 200+ Premium Apps & Games included
+
+✨ What You Get:
+• Device-specific optimization for your iPhone
+• Ad-free experience across all apps
+• Hassle-free installation process  
+• Supercharged social media features
+• 3-month revoke guarantee
+• Dedicated expert support
+
+💰 Price: ${usd_amount} USD or {stars_amount} Stars
+🔗 Full app collection: https://cpanda.app/page/ios-subscriptions
+
+Ready to upgrade your iPhone experience?"""
+        
+        keyboard = [
+            [InlineKeyboardButton("💎 Buy Premium Plan", callback_data="show_plans")],
+            [InlineKeyboardButton("🎁 Panda AppStore Free", url="https://t.me/PandaStoreFreebot")]
+        ]
+        
+        await query.edit_message_text(
+            welcome_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            disable_web_page_preview=True
+        )
+        
+    elif data == "show_plans":
+        pricing_config = load_json_file('data/pricing_config.json', {'usd_amount': 35.0, 'stars_amount': 2500})
+        usd_amount = pricing_config.get('usd_amount', 35)
+        stars_amount = pricing_config.get('stars_amount', 2500)
+        
+        plans_text = f"""💎 Premium Plan - Complete Access
+
+🎮 Featured Apps & Games:
+• CarX Street: Unlimited money & all cars unlocked
+• Car Parking Multiplayer: All cars unlocked & unlimited coins
+• Spotify++: Premium features without subscription  
+• YouTube++: Background play, downloads & ad-free experience
+• Instagram++: Download photos, videos & stories
+
+📱 Premium Features:
+• Device-specific optimization for your iPhone model
+• Premium app access with all features unlocked
+• Hassle-free installation - no technical knowledge required
+• Supercharged social media apps with exclusive features
+• Automatic updates protection - apps stay working
+• Expert support team available 24/7
+
+🔒 Guarantee:
+• 3-month revoke guarantee included
+• Full refund if service doesn't work as promised
+• Dedicated customer support for all issues
+
+💰 Investment: ${usd_amount} USD or {stars_amount} Stars
+⏰ Duration: ONE YEAR full access
+🔗 Complete catalog: https://cpanda.app/page/ios-subscriptions
+
+Choose your preferred payment method:"""
+        
+        keyboard = [
+            [InlineKeyboardButton("💳 Pay with Crypto", callback_data="crypto_payment")],
+            [InlineKeyboardButton("⭐ Pay with Telegram Stars", callback_data="stars_payment")],
+            [InlineKeyboardButton("🔙 Back", callback_data="start")]
+        ]
+        
+        await query.edit_message_text(
+            plans_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            disable_web_page_preview=True
+        )
+
+async def handle_admin_callbacks(query, data, context):
+    """Handle admin menu callbacks"""
+    try:
+        if data == "admin_redeem_codes":
+            redeem_codes = load_json_file('data/redeem_codes.json', {})
+            pricing_config = load_json_file('data/pricing_config.json', {'usd_amount': 35.0})
+            
+            active_codes = 0
+            used_codes = 0
+            
+            if isinstance(redeem_codes, dict):
+                for code_info in redeem_codes.values():
+                    if isinstance(code_info, dict):
+                        if code_info.get('status') == 'active':
+                            active_codes += 1
+                        elif code_info.get('status') == 'used':
+                            used_codes += 1
+            
+            revenue = used_codes * pricing_config.get('usd_amount', 35.0)
+            
+            codes_text = f"""🎫 Redeem Code Management
+
+📊 Dashboard
+┌─ Active: {active_codes} codes
+├─ Used: {used_codes} codes  
+├─ Revenue: ${revenue:,.0f}
+└─ Success: {(used_codes/(active_codes+used_codes)*100 if active_codes+used_codes > 0 else 0):.1f}%
+
+🛠️ Tools"""
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("➕ Add Code", callback_data="admin_add_code"),
+                    InlineKeyboardButton("📋 View All", callback_data="admin_view_codes")
+                ],
+                [
+                    InlineKeyboardButton("📤 Send Code", callback_data="admin_send_code_smart")
+                ],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="admin_panel")]
+            ]
+            
+            await query.edit_message_text(codes_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_add_code":
+            await query.edit_message_text(
+                "➕ Add Redeem Code\n\nSend me the redeem code to add:\n\nFormat: Just type the code\nExample: PANDA-XXXX-XXXX-XXXX",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_redeem_codes")]])
+            )
+            context.user_data['admin_action'] = 'adding_code'
+            
+        elif data == "admin_view_codes":
+            try:
+                from datetime import datetime as dt
+                redeem_codes_data = load_json_file('data/redeem_codes.json', {})
+                refresh_time = dt.now().strftime('%H:%M:%S')
+                
+                # Parse both formats - codes array and direct entries
+                all_codes = {}
+                
+                # Handle array format
+                if 'codes' in redeem_codes_data and isinstance(redeem_codes_data['codes'], list):
+                    for code_obj in redeem_codes_data['codes']:
+                        if isinstance(code_obj, dict) and 'code' in code_obj:
+                            all_codes[code_obj['code']] = code_obj
+                
+                # Handle direct entries format
+                for key, value in redeem_codes_data.items():
+                    if key != 'codes' and isinstance(value, dict):
+                        all_codes[key] = value
+                
+                if not all_codes:
+                    codes_list = f"📋 All Redeem Codes (Updated: {refresh_time})\n\nNo codes available."
+                else:
+                    codes_list = f"📋 All Redeem Codes (Updated: {refresh_time})\n\n"
+                    count = 0
+                    for code, info in all_codes.items():
+                        if count >= 10:
+                            codes_list += f"\n... and {len(all_codes) - 10} more"
+                            break
+                        
+                        status = "✅" if info.get('status') == 'active' else "❌" if info.get('status') == 'used' else "⚪"
+                        codes_list += f"{status} {code}\n"
+                        count += 1
+                    
+                    codes_list += f"\n📊 Total: {len(all_codes)}"
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton("🔄 Refresh", callback_data="admin_view_codes"),
+                        InlineKeyboardButton("🗑️ Delete Code", callback_data="admin_delete_code")
+                    ],
+                    [
+                        InlineKeyboardButton("🗑️ Delete All", callback_data="admin_delete_all_codes")
+                    ],
+                    [InlineKeyboardButton("🔙 Back", callback_data="admin_redeem_codes")]
+                ]
+                
+                await query.edit_message_text(codes_list, reply_markup=InlineKeyboardMarkup(keyboard))
+            except Exception as e:
+                logger.error(f"Error in admin_view_codes: {e}")
+                await query.edit_message_text(
+                    "📋 All Redeem Codes\n\nError loading codes. Please try again.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_redeem_codes")]])
+                )
+            
+        elif data == "admin_send_code_smart":
+            await query.edit_message_text(
+                "📤 Send Code to User\n\nSend me the User ID:\n\nFormat: Just type the number\nExample: 123456789",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_redeem_codes")]])
+            )
+            context.user_data['admin_action'] = 'send_code'
+            
+        elif data == "admin_delete_code":
+            await query.edit_message_text(
+                "🗑️ Delete Redeem Code\n\nSend the code you want to delete:\n\nExample: TEST001\n\n⚠️ This action cannot be undone!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_view_codes")]])
+            )
+            context.user_data['admin_action'] = 'delete_code'
+            
+        elif data == "admin_delete_all_codes":
+            redeem_codes_data = load_json_file('data/redeem_codes.json', {})
+            
+            # Count total codes
+            all_codes = {}
+            if 'codes' in redeem_codes_data and isinstance(redeem_codes_data['codes'], list):
+                for code_obj in redeem_codes_data['codes']:
+                    if isinstance(code_obj, dict) and 'code' in code_obj:
+                        all_codes[code_obj['code']] = code_obj
+            
+            for key, value in redeem_codes_data.items():
+                if key != 'codes' and isinstance(value, dict):
+                    all_codes[key] = value
+            
+            total_codes = len(all_codes)
+            
+            await query.edit_message_text(
+                f"🗑️ Delete All Codes\n\n⚠️ WARNING: This will delete ALL {total_codes} redeem codes!\n\nThis action cannot be undone.\n\nAre you sure?",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Yes, Delete All", callback_data="admin_confirm_delete_all"),
+                        InlineKeyboardButton("❌ Cancel", callback_data="admin_view_codes")
+                    ]
+                ])
+            )
+            
+        elif data == "admin_confirm_delete_all":
+            # Delete all codes
+            empty_data = {}
+            save_json_file('data/redeem_codes.json', empty_data)
+            
+            await query.edit_message_text(
+                "✅ All Codes Deleted\n\nAll redeem codes have been successfully deleted.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 View Codes", callback_data="admin_view_codes")],
+                    [InlineKeyboardButton("🔙 Back to Codes", callback_data="admin_redeem_codes")]
+                ])
+            )
+            
+        elif data == "admin_users":
+            conversation_histories = load_json_file('data/conversation_histories.json', {})
+            banned_users = load_json_file('data/banned_users.json', {})
+            
+            total_users = len(conversation_histories) if isinstance(conversation_histories, dict) else 0
+            banned_count = len(banned_users) if isinstance(banned_users, dict) else 0
+            active_users = total_users - banned_count
+            
+            users_text = f"""👥 User Management
+
+📊 Stats
+┌─ Total Users: {total_users:,}
+├─ Active: {active_users:,}
+└─ Banned: {banned_count}
+
+🛠️ Tools"""
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("📋 View Users", callback_data="admin_view_users"),
+                    InlineKeyboardButton("🔍 Search User", callback_data="admin_search_user")
+                ],
+                [
+                    InlineKeyboardButton("⛔ Ban User", callback_data="admin_ban_user_input"),
+                    InlineKeyboardButton("✅ Unban User", callback_data="admin_unban_user_input")
+                ],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="admin_panel")]
+            ]
+            
+            await query.edit_message_text(users_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_broadcasts":
+            conversation_histories = load_json_file('data/conversation_histories.json', {})
+            redeem_codes = load_json_file('data/redeem_codes.json', {})
+            
+            total_users = len(conversation_histories) if isinstance(conversation_histories, dict) else 0
+            premium_users = len([c for c in redeem_codes.values() if isinstance(c, dict) and c.get('status') == 'used'])
+            
+            broadcast_text = f"""📢 Panda AppStore Broadcasting
+
+🎯 Marketing Hub
+┌─ Total Reach: {total_users:,} users
+├─ Premium Base: {premium_users} subscribers
+└─ Engagement: Professional messaging
+
+🚀 Campaign Options"""
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("📢 Marketing Blast", callback_data="admin_broadcast_all"),
+                    InlineKeyboardButton("💎 VIP Exclusive", callback_data="admin_broadcast_premium")
+                ],
+                [
+                    InlineKeyboardButton("📝 Templates", callback_data="admin_broadcast_templates"),
+                    InlineKeyboardButton("📊 Campaign Stats", callback_data="admin_broadcast_stats")
+                ],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="admin_panel")]
+            ]
+            
+            await query.edit_message_text(broadcast_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_broadcast_all":
+            broadcast_text = """📱 Panda AppStore Marketing Campaign
+
+🎯 Target Audience: All Users
+📊 Reach: Maximum exposure to entire user base
+🚀 Purpose: General announcements, promotions, updates
+
+✍️ Compose your professional message:
+
+🔸 Tips for effective messaging:
+• Use clear, engaging language
+• Include call-to-action if needed
+• Keep it concise and valuable
+• Professional tone with Panda branding
+
+Send your message now to launch the campaign."""
+
+            await query.edit_message_text(
+                broadcast_text,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Broadcasting", callback_data="admin_broadcasts")]])
+            )
+            context.user_data['admin_action'] = 'broadcast_all'
+            
+        elif data == "admin_broadcast_premium":
+            broadcast_text = """💎 Panda AppStore VIP Campaign
+
+🎯 Target Audience: Premium Subscribers Only
+👑 Reach: Exclusive communication to paying customers
+🌟 Purpose: VIP updates, premium features, loyalty rewards
+
+✍️ Compose your exclusive VIP message:
+
+🔸 VIP messaging best practices:
+• Acknowledge their premium status
+• Offer exclusive value/benefits
+• Use premium language and tone
+• Express appreciation for their support
+
+Send your VIP message to launch the exclusive campaign."""
+
+            await query.edit_message_text(
+                broadcast_text,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Broadcasting", callback_data="admin_broadcasts")]])
+            )
+            context.user_data['admin_action'] = 'broadcast_premium'
+            
+        elif data == "admin_broadcast_templates":
+            templates_text = """📝 Panda AppStore Message Templates
+
+🎯 Professional Broadcast Templates
+
+🔥 PROMOTIONAL TEMPLATES:
+
+🎉 New Feature Launch:
+"🚀 Exciting News! Panda AppStore just added [Feature Name]! 
+Experience enhanced [benefit] with our latest update. 
+Premium subscribers get early access.
+Transform your iPhone today!"
+
+💰 Limited Time Offer:
+"⏰ FLASH SALE: Premium access for just $[price]!
+✨ Unlock 200+ premium apps
+🎮 CarX Street unlimited money
+📱 Spotify++, YouTube++, Instagram++
+Valid for 48 hours only!"
+
+🌟 VIP EXCLUSIVE TEMPLATES:
+
+👑 Premium Appreciation:
+"💎 Thank you for being a valued Premium subscriber!
+🎁 Exclusive bonus: [Special offer]
+🔧 Priority support continues
+💝 Your loyalty means everything to us"
+
+🎯 Engagement Boost:
+"📱 How's your Panda AppStore experience?
+🌟 Rate us and share feedback
+🎮 Favorite modded apps?
+💬 Reply to this message!"
+
+Choose template type or compose custom message."""
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("🎉 Promotional", callback_data="admin_broadcast_promo"),
+                    InlineKeyboardButton("👑 VIP Exclusive", callback_data="admin_broadcast_vip")
+                ],
+                [
+                    InlineKeyboardButton("🎯 Engagement", callback_data="admin_broadcast_engage"),
+                    InlineKeyboardButton("📢 Custom Message", callback_data="admin_broadcast_all")
+                ],
+                [InlineKeyboardButton("🔙 Back to Broadcasting", callback_data="admin_broadcasts")]
+            ]
+            
+            await query.edit_message_text(templates_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        
+        elif data == "admin_broadcast_stats":
+            conversation_histories = load_json_file('data/conversation_histories.json', {})
+            redeem_codes = load_json_file('data/redeem_codes.json', {})
+            
+            total_users = len(conversation_histories) if isinstance(conversation_histories, dict) else 0
+            premium_users = len([c for c in redeem_codes.values() if isinstance(c, dict) and c.get('status') == 'used'])
+            free_users = total_users - premium_users
+            
+            # Calculate engagement metrics
+            active_users = 0
+            recent_messages = 0
+            
+            for user_id, history in conversation_histories.items():
+                if isinstance(history, list) and history:
+                    active_users += 1
+                    recent_messages += len(history)
+            
+            engagement_rate = (active_users / total_users * 100) if total_users > 0 else 0
+            
+            # Safe percentage calculations to prevent division by zero
+            premium_percent = (premium_users/total_users*100) if total_users > 0 else 0
+            free_percent = (free_users/total_users*100) if total_users > 0 else 0
+            conversion_rate = (premium_users/total_users*100) if total_users > 0 else 0
+            
+            # Add timestamp for refresh tracking
+            import datetime
+            refresh_time = datetime.datetime.now().strftime('%H:%M:%S')
+            
+            stats_text = f"""📊 Panda AppStore Campaign Analytics
+
+👥 Audience Demographics
+┌─ Total Users: {total_users:,}
+├─ Premium Subscribers: {premium_users} ({premium_percent:.1f}%)
+├─ Free Users: {free_users} ({free_percent:.1f}%)
+└─ Engagement Rate: {engagement_rate:.1f}%
+
+📈 Performance Metrics
+┌─ Active Conversations: {active_users}
+├─ Message Volume: {recent_messages:,}
+├─ Conversion Rate: {conversion_rate:.1f}%
+└─ User Retention: Professional level
+
+🎯 Marketing Insights
+┌─ Best Performance: VIP exclusive campaigns
+├─ Optimal Timing: Peak engagement hours
+├─ Content Type: Feature announcements
+└─ Call-to-Action: Direct purchase links
+
+📱 Next Campaign Recommendations
+• Target free users with conversion campaigns
+• Reward premium users with exclusive content
+• Implement A/B testing for message effectiveness
+• Schedule broadcasts during peak activity
+
+🕐 Last Updated: {refresh_time}"""
+
+            keyboard = [
+                [
+                    InlineKeyboardButton(f"🔄 Refresh Stats", callback_data="admin_broadcast_stats"),
+                    InlineKeyboardButton("📊 Export Data", callback_data="admin_export_stats")
+                ],
+                [InlineKeyboardButton("🔙 Back to Broadcasting", callback_data="admin_broadcasts")]
+            ]
+            
+            await query.edit_message_text(stats_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_broadcast_promo":
+            promo_text = """🎉 Promotional Campaign Template
+
+📱 Panda AppStore Feature Launch
+
+✍️ Ready-to-use promotional message:
+
+🚀 Exciting News! Panda AppStore just added enhanced CarX Street features! 
+Experience unlimited money, unlocked cars, and premium modifications with our latest update. 
+Premium subscribers get immediate access to all new content.
+Transform your iPhone gaming today - no jailbreak required!
+
+💎 Premium Plan: One year access for just $35 USD or 2500 Stars
+🎮 200+ modded apps including CarX Street, Spotify++, YouTube++
+🔧 Professional installation support included
+
+Ready to launch this promotional campaign?
+Send this message or modify it before broadcasting."""
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("📢 Send This Message", callback_data="admin_broadcast_all"),
+                    InlineKeyboardButton("✏️ Modify & Send", callback_data="admin_broadcast_all")
+                ],
+                [InlineKeyboardButton("🔙 Back to Templates", callback_data="admin_broadcast_templates")]
+            ]
+            
+            await query.edit_message_text(promo_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            context.user_data['admin_action'] = 'broadcast_all'
+            
+        elif data == "admin_broadcast_vip":
+            vip_text = """👑 VIP Exclusive Campaign Template
+
+💎 Panda AppStore Premium Appreciation
+
+✍️ Ready-to-use VIP exclusive message:
+
+Dear Premium Subscriber,
+
+Thank you for being a valued member of our Panda AppStore family! 
+
+🎁 Exclusive VIP Benefits Update:
+• Priority access to new app releases
+• Enhanced CarX Street features now available
+• Premium customer support with faster response times
+• 3-month revoke guarantee protection
+
+Your continued support enables us to deliver the best premium iOS app experience. We're working on exciting new features exclusively for our VIP members.
+
+Questions? Reply to this message for priority support.
+
+Best regards,
+Panda AppStore Team
+
+Ready to send this VIP appreciation message?"""
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("💎 Send to VIP Users", callback_data="admin_broadcast_premium"),
+                    InlineKeyboardButton("✏️ Modify Message", callback_data="admin_broadcast_premium")
+                ],
+                [InlineKeyboardButton("🔙 Back to Templates", callback_data="admin_broadcast_templates")]
+            ]
+            
+            await query.edit_message_text(vip_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            context.user_data['admin_action'] = 'broadcast_premium'
+            
+        elif data == "admin_broadcast_engage":
+            engage_text = """🎯 Engagement Campaign Template
+
+📱 Panda AppStore Community Engagement
+
+✍️ Ready-to-use engagement message:
+
+Hello Panda AppStore User!
+
+We value your experience and want to hear from you:
+
+🌟 Quick Survey (2 minutes):
+• How satisfied are you with our app selection?
+• Which modded apps do you use most?
+• What new features would you like to see?
+• How can we improve your experience?
+
+🎁 Participation Reward:
+Share your feedback and get priority consideration for beta features!
+
+📱 Popular This Week:
+• CarX Street unlimited money
+• YouTube++ background play
+• Instagram++ story download
+
+Reply with your thoughts or questions - we read every message!
+
+Thank you for being part of our community.
+
+Ready to boost engagement with this message?"""
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("🎯 Send Engagement Survey", callback_data="admin_broadcast_all"),
+                    InlineKeyboardButton("✏️ Customize Survey", callback_data="admin_broadcast_all")
+                ],
+                [InlineKeyboardButton("🔙 Back to Templates", callback_data="admin_broadcast_templates")]
+            ]
+            
+            await query.edit_message_text(engage_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            context.user_data['admin_action'] = 'broadcast_all'
+            
+        elif data == "admin_export_stats":
+            import datetime
+            
+            # Generate export data
+            conversation_histories = load_json_file('data/conversation_histories.json', {})
+            redeem_codes = load_json_file('data/redeem_codes.json', {})
+            
+            export_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            total_users = len(conversation_histories) if isinstance(conversation_histories, dict) else 0
+            premium_users = len([c for c in redeem_codes.values() if isinstance(c, dict) and c.get('status') == 'used'])
+            
+            export_text = f"""📊 Campaign Data Export
+            
+🕒 Generated: {export_time}
+
+📈 Summary Statistics:
+┌─ Total Users: {total_users:,}
+├─ Premium Subscribers: {premium_users}
+├─ Conversion Rate: {(premium_users/total_users*100) if total_users > 0 else 0:.1f}%
+└─ Free Users: {total_users - premium_users}
+
+📋 Export Options:
+• Data has been compiled for analysis
+• Statistics updated with current metrics
+• Ready for campaign planning
+
+Use this data for marketing strategy and campaign optimization."""
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("🔄 Refresh Export", callback_data="admin_export_stats"),
+                    InlineKeyboardButton("📊 New Campaign", callback_data="admin_broadcasts")
+                ],
+                [InlineKeyboardButton("🔙 Back to Stats", callback_data="admin_broadcast_stats")]
+            ]
+            
+            await query.edit_message_text(export_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_payments":
+            pending_payments = load_json_file('data/pending_star_payments.json', {})
+            redeem_codes = load_json_file('data/redeem_codes.json', {})
+            pricing_config = load_json_file('data/pricing_config.json', {'usd_amount': 35.0, 'stars_amount': 2500})
+            
+            used_codes = len([c for c in redeem_codes.values() if isinstance(c, dict) and c.get('status') == 'used'])
+            pending_stars = len([p for p in pending_payments.values() if isinstance(p, dict) and p.get('screenshot_sent')])
+            revenue = used_codes * pricing_config.get('usd_amount', 35.0)
+            
+            payments_text = f"""💰 Payment Monitoring
+
+📊 Overview
+┌─ Total Revenue: ${revenue:,.0f}
+├─ Completed: {used_codes} codes
+├─ Pending Stars: {pending_stars}
+└─ Current Price: ${pricing_config.get('usd_amount', 35)} / {pricing_config.get('stars_amount', 2500)} ⭐
+
+🛠️ Tools"""
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("⭐ Stars Payments", callback_data="admin_stars_payments"),
+                    InlineKeyboardButton("💳 Crypto Payments", callback_data="admin_crypto_payments")
+                ],
+                [
+                    InlineKeyboardButton("📊 Revenue Report", callback_data="admin_revenue_report"),
+                    InlineKeyboardButton("🔧 Payment Settings", callback_data="admin_payment_settings")
+                ],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="admin_panel")]
+            ]
+            
+            await query.edit_message_text(payments_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_pricing_config":
+            pricing_config = load_json_file('data/pricing_config.json', {'usd_amount': 35.0, 'stars_amount': 2500})
+            
+            pricing_text = f"""💵 Pricing Configuration
+
+📊 Current Pricing
+┌─ USD Amount: ${pricing_config.get('usd_amount', 35):.2f}
+└─ Telegram Stars: {pricing_config.get('stars_amount', 2500)} ⭐
+
+🛠️ Tools"""
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("💵 Change USD", callback_data="admin_change_usd"),
+                    InlineKeyboardButton("⭐ Change Stars", callback_data="admin_change_stars")
+                ],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="admin_panel")]
+            ]
+            
+            await query.edit_message_text(pricing_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_change_usd":
+            pricing_config = load_json_file('data/pricing_config.json', {'usd_amount': 35.0})
+            await query.edit_message_text(
+                f"💵 Change USD Price\n\nCurrent: ${pricing_config.get('usd_amount', 35):.2f}\n\nSend new USD amount:\nExample: 40.00",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_pricing_config")]])
+            )
+            context.user_data['admin_action'] = 'change_usd'
+            
+        elif data == "admin_change_stars":
+            pricing_config = load_json_file('data/pricing_config.json', {'stars_amount': 2500})
+            await query.edit_message_text(
+                f"⭐ Change Stars Price\n\nCurrent: {pricing_config.get('stars_amount', 2500)} Stars\n\nSend new Stars amount:\nExample: 3000",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_pricing_config")]])
+            )
+            context.user_data['admin_action'] = 'change_stars'
+            
+        elif data == "admin_system_status":
+            # System status with real-time metrics
+            import platform
+            import datetime
+            
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+            
+            from datetime import datetime as dt
+            uptime = dt.now() - dt.fromtimestamp(psutil.boot_time())
+            
+            system_text = f"""📊 System Status
+
+🖥️ System Info
+┌─ Platform: {platform.system()} {platform.release()}
+├─ Python: {platform.python_version()}
+├─ Uptime: {str(uptime).split('.')[0]}
+└─ Load: {psutil.getloadavg()[0]:.2f}
+
+💾 Resources
+┌─ CPU Usage: {cpu_percent:.1f}%
+├─ Memory: {memory.percent:.1f}% ({memory.used // 1024**3}GB / {memory.total // 1024**3}GB)
+├─ Disk: {disk.percent:.1f}% ({disk.used // 1024**3}GB / {disk.total // 1024**3}GB)
+└─ Processes: {len(psutil.pids())}
+
+🔗 Bot Status
+┌─ Status: Running
+├─ Handlers: Active
+└─ Last Update: {dt.now().strftime('%H:%M:%S')}"""
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("🔄 Refresh", callback_data="admin_system_status"),
+                    InlineKeyboardButton("📈 Detailed Stats", callback_data="admin_detailed_stats")
+                ],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="admin_panel")]
+            ]
+            
+            await query.edit_message_text(system_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        # Add missing sub-menu handlers
+        elif data == "admin_view_users":
+            try:
+                import datetime
+                conversation_histories = load_json_file('data/conversation_histories.json', {})
+                banned_users = load_json_file('data/banned_users.json', {})
+                
+                # Add timestamp to make each refresh unique
+                from datetime import datetime as dt
+                refresh_time = dt.now().strftime('%H:%M:%S')
+                users_list = f"📋 Recent Users (Updated: {refresh_time})\n\n"
+                
+                if not conversation_histories or not isinstance(conversation_histories, dict):
+                    users_list += "No users found."
+                else:
+                    count = 0
+                    for user_id, history in conversation_histories.items():
+                        if count >= 10:
+                            users_list += f"\n... and {len(conversation_histories) - 10} more"
+                            break
+                        
+                        try:
+                            # Safe data handling with validation
+                            status = "⛔" if str(user_id) in banned_users else "✅"
+                            
+                            # Format timestamp safely - handle both numeric and ISO formats
+                            timestamp = 'Never'
+                            if isinstance(history, list) and history:
+                                last_msg = history[-1]
+                                if isinstance(last_msg, dict) and 'timestamp' in last_msg:
+                                    ts = last_msg['timestamp']
+                                    try:
+                                        if isinstance(ts, (int, float)):
+                                            # Numeric timestamp
+                                            dt = datetime.datetime.fromtimestamp(ts)
+                                            timestamp = dt.strftime('%m/%d %H:%M')
+                                        elif isinstance(ts, str):
+                                            if ts.replace('.', '').replace('-', '').replace('T', '').replace(':', '').isdigit():
+                                                # ISO format string
+                                                dt = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                                                timestamp = dt.strftime('%m/%d %H:%M')
+                                            elif ts.replace('.', '').isdigit():
+                                                # String numeric timestamp
+                                                dt = datetime.datetime.fromtimestamp(float(ts))
+                                                timestamp = dt.strftime('%m/%d %H:%M')
+                                    except (ValueError, OSError, TypeError):
+                                        timestamp = 'Invalid'
+                            
+                            users_list += f"{status} User {user_id}\n📅 Last: {timestamp}\n\n"
+                            count += 1
+                            
+                        except Exception as item_error:
+                            # Skip problematic entries but continue processing
+                            logger.warning(f"Skipping user {user_id} due to data error: {item_error}")
+                            continue
+                
+                keyboard = [
+                    [InlineKeyboardButton("🔄 Refresh", callback_data="admin_view_users")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="admin_users")]
+                ]
+                await query.edit_message_text(users_list, reply_markup=InlineKeyboardMarkup(keyboard))
+                
+            except Exception as e:
+                logger.error(f"Error in admin_view_users: {e}")
+                await query.edit_message_text(
+                    "📋 Recent Users\n\nError loading user data. Please try again.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_users")]])
+                )
+            
+        elif data == "admin_stars_payments":
+            import datetime
+            pending_payments = load_json_file('data/pending_star_payments.json', {})
+            
+            from datetime import datetime as dt; refresh_time = dt.now().strftime('%H:%M:%S')
+            stars_text = f"⭐ Stars Payments (Updated: {refresh_time})\n\n"
+            if not pending_payments:
+                stars_text += "No pending Stars payments."
+            else:
+                for payment_id, info in list(pending_payments.items())[:5]:
+                    status = "📸" if info.get('screenshot_sent') else "⏳"
+                    stars_text += f"{status} Payment {payment_id[:8]}...\n"
+            
+            keyboard = [
+                [InlineKeyboardButton("🔄 Refresh", callback_data="admin_stars_payments")],
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_payments")]
+            ]
+            await query.edit_message_text(stars_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_crypto_payments":
+            import datetime
+            payment_tracking = load_json_file('data/payment_tracking.json', {})
+            
+            from datetime import datetime as dt; refresh_time = dt.now().strftime('%H:%M:%S')
+            crypto_text = f"💳 Crypto Payments (Updated: {refresh_time})\n\n"
+            if not payment_tracking:
+                crypto_text += "No crypto payments tracked."
+            else:
+                for order_id, info in list(payment_tracking.items())[:5]:
+                    status = "✅" if info.get('status') == 'completed' else "⏳"
+                    crypto_text += f"{status} Order {order_id[:8]}...\n"
+            
+            keyboard = [
+                [InlineKeyboardButton("🔄 Refresh", callback_data="admin_crypto_payments")],
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_payments")]
+            ]
+            await query.edit_message_text(crypto_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_revenue_report":
+            import datetime
+            redeem_codes = load_json_file('data/redeem_codes.json', {})
+            pricing_config = load_json_file('data/pricing_config.json', {'usd_amount': 35.0})
+            
+            used_codes = len([c for c in redeem_codes.values() if isinstance(c, dict) and c.get('status') == 'used'])
+            total_revenue = used_codes * pricing_config.get('usd_amount', 35.0)
+            
+            from datetime import datetime as dt; refresh_time = dt.now().strftime('%H:%M:%S')
+            report_text = f"""📊 Revenue Report (Updated: {refresh_time})
+            
+💰 Total Revenue: ${total_revenue:,.2f}
+🎫 Codes Sold: {used_codes}
+💵 Average per Sale: ${pricing_config.get('usd_amount', 35.0):.2f}
+
+📈 Performance
+└─ Conversion Rate: Coming soon
+└─ Monthly Growth: Coming soon"""
+            
+            keyboard = [
+                [InlineKeyboardButton("🔄 Refresh", callback_data="admin_revenue_report")],
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_payments")]
+            ]
+            await query.edit_message_text(report_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_payment_settings":
+            import os
+            # Check environment variable first, then config file
+            oxapay_key = os.getenv('OXAPAY_API_KEY')
+            if not oxapay_key:
+                oxapay_key = load_json_file('data/oxapay_config.json', {}).get('api_key', 'Not configured')
+            else:
+                oxapay_key = 'Configured'
+            stars_channel = load_json_file('data/stars_config.json', {}).get('channel_id', 'Not configured')
+            
+            settings_text = f"""🔧 Payment Settings
+            
+💳 OxaPay Integration
+├─ API Key: {'✅ Configured' if oxapay_key != 'Not configured' else '❌ Not set'}
+└─ Status: {'Active' if oxapay_key != 'Not configured' else 'Inactive'}
+
+⭐ Telegram Stars
+├─ Channel: {'✅ Configured' if stars_channel != 'Not configured' else '❌ Not set'}
+└─ Auto-processing: {'Enabled' if stars_channel != 'Not configured' else 'Disabled'}
+
+🛠️ Configuration"""
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("💳 Test OxaPay", callback_data="admin_test_oxapay"),
+                    InlineKeyboardButton("⭐ Setup Stars", callback_data="admin_setup_stars")
+                ],
+                [
+                    InlineKeyboardButton("🔧 Configure OxaPay", callback_data="admin_configure_oxapay"),
+                    InlineKeyboardButton("🔗 Set Paid Post URL", callback_data="admin_set_paid_post")
+                ],
+                [
+                    InlineKeyboardButton("🔄 Refresh Status", callback_data="admin_refresh_payment_settings"),
+                    InlineKeyboardButton("📊 Payment Analytics", callback_data="admin_payment_analytics")
+                ],
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_payments")]
+            ]
+            
+            await query.edit_message_text(settings_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_refresh_payment_settings":
+            import datetime
+            import os
+            # Check environment variable first, then config file
+            oxapay_key = os.getenv('OXAPAY_API_KEY')
+            if not oxapay_key:
+                oxapay_key = load_json_file('data/oxapay_config.json', {}).get('api_key', 'Not configured')
+            else:
+                oxapay_key = 'Configured'
+            stars_channel = load_json_file('data/stars_config.json', {}).get('channel_id', 'Not configured')
+            
+            from datetime import datetime as dt; refresh_time = dt.now().strftime('%H:%M:%S')
+            settings_text = f"""🔧 Payment Settings (Updated: {refresh_time})
+            
+💳 OxaPay Integration
+├─ API Key: {'✅ Configured' if oxapay_key != 'Not configured' else '❌ Not set'}
+└─ Status: {'Active' if oxapay_key != 'Not configured' else 'Inactive'}
+
+⭐ Telegram Stars
+├─ Channel: {'✅ Configured' if stars_channel != 'Not configured' else '❌ Not set'}
+└─ Auto-processing: {'Enabled' if stars_channel != 'Not configured' else 'Disabled'}
+
+🛠️ Configuration"""
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("💳 Test OxaPay", callback_data="admin_test_oxapay"),
+                    InlineKeyboardButton("⭐ Setup Stars", callback_data="admin_setup_stars")
+                ],
+                [
+                    InlineKeyboardButton("🔧 Configure OxaPay", callback_data="admin_configure_oxapay"),
+                    InlineKeyboardButton("🔗 Set Paid Post URL", callback_data="admin_set_paid_post")
+                ],
+                [
+                    InlineKeyboardButton("🔄 Refresh Status", callback_data="admin_refresh_payment_settings"),
+                    InlineKeyboardButton("📊 Payment Analytics", callback_data="admin_payment_analytics")
+                ],
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_payments")]
+            ]
+            
+            await query.edit_message_text(settings_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_configure_oxapay":
+            await query.edit_message_text(
+                "💳 Configure OxaPay API\n\nSend your OxaPay API key:\n\nExample: sandbox_12345abcdef67890\n\n⚠️ Keep your API key secure!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_payment_settings")]])
+            )
+            context.user_data['admin_action'] = 'configure_oxapay'
+            
+        elif data == "admin_set_paid_post":
+            stars_config = load_json_file('data/stars_config.json', {})
+            current_url = stars_config.get('paid_post_url', 'Not configured')
+            
+            await query.edit_message_text(
+                f"🔗 Set Paid Post URL\n\nCurrent URL: {current_url}\n\nSend the Telegram paid post URL for Stars payments:\n\nExample: https://t.me/yourchannel/123",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_payment_settings")]])
+            )
+            context.user_data['admin_action'] = 'set_paid_post_url'
+            
+        elif data == "admin_test_oxapay":
+            try:
+                import os
+                # Check environment variable first, then config file
+                api_key = os.getenv('OXAPAY_API_KEY')
+                if not api_key:
+                    oxapay_config = load_json_file('data/oxapay_config.json', {})
+                    api_key = oxapay_config.get('api_key')
+                
+                if not api_key:
+                    await query.edit_message_text(
+                        "❌ OxaPay API Test Failed\n\nAPI key not configured. Please configure OxaPay API key first.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔧 Configure OxaPay", callback_data="admin_configure_oxapay")],
+                            [InlineKeyboardButton("🔙 Back", callback_data="admin_payment_settings")]
+                        ])
+                    )
+                    return
+                
+                # Test API connection with correct endpoint and headers
+                headers = {
+                    'Content-Type': 'application/json'
+                }
+                
+                payload = {
+                    'merchant': api_key,
+                    'amount': 1.00,
+                    'currency': 'USD',
+                    'lifeTime': 30,
+                    'feePaidByPayer': 1,
+                    'description': 'API Test',
+                    'orderId': f'test_{int(time.time())}'
+                }
+                
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        'https://api.oxapay.com/merchants/request',
+                        json=payload,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=15)
+                    ) as response:
+                        response_text = await response.text()
+                        logger.info(f"OxaPay Test - Status: {response.status}, Response: {response_text}")
+                        
+                        if response.status == 200:
+                            try:
+                                result = await response.json()
+                                if result.get('result') == 100:
+                                    test_text = "✅ OxaPay API Test Successful\n\nConnection established successfully.\nAPI key is valid and active."
+                                else:
+                                    error_msg = result.get('message', 'Invalid API response')
+                                    test_text = f"❌ OxaPay API Test Failed\n\nError: {error_msg}"
+                            except json.JSONDecodeError:
+                                test_text = f"❌ OxaPay API Test Failed\n\nInvalid JSON response: {response_text[:100]}"
+                        else:
+                            test_text = f"❌ OxaPay API Test Failed\n\nHTTP {response.status}: {response_text[:100]}"
+                            
+            except Exception as e:
+                logger.error(f"OxaPay test error: {e}")
+                test_text = f"❌ OxaPay API Test Failed\n\nConnection error: {str(e)}"
+            
+            await query.edit_message_text(
+                test_text,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Test Again", callback_data="admin_test_oxapay")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="admin_payment_settings")]
+                ])
+            )
+            
+        elif data == "admin_refresh_payment_settings":
+            # Refresh and show payment settings with updated status
+            import os
+            oxapay_config = load_json_file('data/oxapay_config.json', {})
+            stars_config = load_json_file('data/stars_config.json', {})
+            
+            # Check OxaPay status
+            api_key = os.getenv('OXAPAY_API_KEY') or oxapay_config.get('api_key')
+            oxapay_status = "✅ Configured" if api_key else "❌ Not configured"
+            
+            # Check Stars status
+            stars_channel = stars_config.get('channel_id', 'Not configured')
+            stars_url = stars_config.get('paid_post_url', 'Not configured')
+            
+            from datetime import datetime as dt
+            refresh_time = dt.now().strftime('%H:%M:%S')
+            
+            settings_text = f"""⚙️ Payment Settings (Updated: {refresh_time})
+            
+💳 OxaPay Configuration
+├─ Status: {oxapay_status}
+├─ API Key: {'***' + api_key[-4:] if api_key else 'Not set'}
+└─ Connection: Ready for testing
+
+⭐ Telegram Stars Setup
+├─ Channel ID: {stars_channel}
+├─ Paid Post URL: {stars_url}
+└─ Auto-processing: {'Enabled' if stars_channel != 'Not configured' else 'Disabled'}
+
+🛠️ Configuration"""
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("💳 Test OxaPay", callback_data="admin_test_oxapay"),
+                    InlineKeyboardButton("⭐ Setup Stars", callback_data="admin_setup_stars")
+                ],
+                [
+                    InlineKeyboardButton("🔧 Configure OxaPay", callback_data="admin_configure_oxapay"),
+                    InlineKeyboardButton("🔗 Set Paid Post URL", callback_data="admin_set_paid_post")
+                ],
+                [
+                    InlineKeyboardButton("🔄 Refresh Status", callback_data="admin_refresh_payment_settings"),
+                    InlineKeyboardButton("📊 Payment Analytics", callback_data="admin_payment_analytics")
+                ],
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_payments")]
+            ]
+            
+            await query.edit_message_text(settings_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_setup_stars":
+            stars_config = load_json_file('data/stars_config.json', {})
+            channel_id = stars_config.get('channel_id', 'Not configured')
+            
+            setup_text = f"""⭐ Telegram Stars Setup
+            
+Current Configuration:
+├─ Channel ID: {channel_id}
+├─ Auto-processing: {'✅ Enabled' if channel_id != 'Not configured' else '❌ Disabled'}
+└─ Status: {'Active' if channel_id != 'Not configured' else 'Inactive'}
+
+Setup Instructions:
+1. Create a payment channel
+2. Add bot as admin with full permissions
+3. Configure channel ID below"""
+            
+            keyboard = [
+                [InlineKeyboardButton("🔧 Configure Channel", callback_data="admin_configure_stars_channel")],
+                [InlineKeyboardButton("📋 View Setup Guide", callback_data="admin_stars_guide")],
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_payment_settings")]
+            ]
+            
+            await query.edit_message_text(setup_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_payment_analytics":
+            from datetime import datetime as dt
+            payment_tracking = load_json_file('data/payment_tracking.json', {})
+            stars_payments = load_json_file('data/stars_payments.json', {})
+            
+            crypto_count = len(payment_tracking)
+            stars_count = len(stars_payments)
+            total_payments = crypto_count + stars_count
+            
+            # Calculate totals
+            crypto_total = sum(float(info.get('amount', 0)) for info in payment_tracking.values())
+            stars_total = sum(int(info.get('amount', 0)) for info in stars_payments.values())
+            
+            refresh_time = dt.now().strftime('%H:%M:%S')
+            
+            # Calculate averages
+            crypto_avg = f"${crypto_total/crypto_count:.2f} per transaction" if crypto_count > 0 else "No crypto transactions"
+            stars_avg = f"{stars_total/stars_count:.0f} ⭐ per transaction" if stars_count > 0 else "No Stars transactions"
+            
+            analytics_text = f"""📊 Payment Analytics (Updated: {refresh_time})
+            
+💳 Payment Methods
+├─ Cryptocurrency: {crypto_count} transactions (${crypto_total:.2f})
+├─ Telegram Stars: {stars_count} transactions ({stars_total:,} stars)
+└─ Total: {total_payments} payments
+
+📈 Performance Metrics
+├─ Crypto Average: {crypto_avg}
+├─ Stars Average: {stars_avg}
+└─ Last Updated: {refresh_time}"""
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("💳 Crypto Details", callback_data="admin_crypto_analytics"),
+                    InlineKeyboardButton("⭐ Stars Details", callback_data="admin_stars_analytics")
+                ],
+                [InlineKeyboardButton("🔄 Refresh", callback_data="admin_payment_analytics")],
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_payment_settings")]
+            ]
+            
+            await query.edit_message_text(analytics_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_configure_stars_channel":
+            await query.edit_message_text(
+                "⭐ Configure Stars Channel\n\nSend the Channel ID (with -100 prefix):\n\nExample: -1001234567890",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_setup_stars")]])
+            )
+            context.user_data['admin_action'] = 'configure_stars_channel'
+            
+        elif data == "admin_stars_guide":
+            guide_text = """📋 Telegram Stars Setup Guide
+
+Step-by-step instructions:
+
+1️⃣ Create Payment Channel
+   • Create a new Telegram channel
+   • Make it private or public
+   • Note the channel ID
+
+2️⃣ Add Bot as Admin
+   • Add your bot to the channel
+   • Give full administrator permissions
+   • Ensure bot can read messages
+
+3️⃣ Configure Channel ID
+   • Use /id command in channel
+   • Copy the channel ID (starts with -100)
+   • Enter it in bot configuration
+
+4️⃣ Test Setup
+   • Send test Stars payment
+   • Check auto-processing works
+   • Verify code delivery"""
+            
+            await query.edit_message_text(
+                guide_text,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_setup_stars")]])
+            )
+            
+        elif data == "admin_crypto_analytics":
+            from datetime import datetime as dt
+            payment_tracking = load_json_file('data/payment_tracking.json', {})
+            refresh_time = dt.now().strftime('%H:%M:%S')
+            
+            if not payment_tracking:
+                analytics_text = f"💳 Crypto Payment Analytics (Updated: {refresh_time})\n\nNo cryptocurrency payments recorded yet."
+            else:
+                total_amount = sum(float(info.get('amount', 0)) for info in payment_tracking.values())
+                avg_amount = total_amount / len(payment_tracking) if payment_tracking else 0
+                
+                analytics_text = f"""💳 Crypto Payment Analytics (Updated: {refresh_time})
+
+📊 Statistics
+├─ Total Transactions: {len(payment_tracking)}
+├─ Total Amount: ${total_amount:.2f}
+├─ Average Payment: ${avg_amount:.2f}
+└─ Last Refresh: {refresh_time}
+
+🔗 Recent Transactions"""
+                
+                for order_id, info in list(payment_tracking.items())[:3]:
+                    status = info.get('status', 'Unknown')
+                    amount = info.get('amount', '0')
+                    analytics_text += f"\n├─ {order_id[:8]}... | ${amount} | {status}"
+            
+            await query.edit_message_text(
+                analytics_text,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Refresh", callback_data="admin_crypto_analytics")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="admin_payment_analytics")]
+                ])
+            )
+            
+        elif data == "admin_stars_analytics":
+            from datetime import datetime as dt
+            stars_payments = load_json_file('data/stars_payments.json', {})
+            refresh_time = dt.now().strftime('%H:%M:%S')
+            
+            if not stars_payments:
+                analytics_text = f"⭐ Stars Payment Analytics (Updated: {refresh_time})\n\nNo Telegram Stars payments recorded yet."
+            else:
+                total_stars = sum(int(info.get('amount', 0)) for info in stars_payments.values())
+                avg_stars = total_stars / len(stars_payments) if stars_payments else 0
+                
+                analytics_text = f"""⭐ Stars Payment Analytics (Updated: {refresh_time})
+
+📊 Statistics
+├─ Total Transactions: {len(stars_payments)}
+├─ Total Stars: {total_stars:,} stars
+├─ Average Payment: {avg_stars:.0f} stars
+└─ Last Refresh: {refresh_time}
+
+🌟 Recent Transactions"""
+                
+                for payment_id, info in list(stars_payments.items())[:3]:
+                    status = info.get('status', 'Unknown')
+                    amount = info.get('amount', '0')
+                    analytics_text += f"\n├─ {payment_id[:8]}... | {amount} stars | {status}"
+            
+            await query.edit_message_text(
+                analytics_text,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Refresh", callback_data="admin_stars_analytics")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="admin_payment_analytics")]
+                ])
+            )
+            
+        elif data == "admin_search_user":
+            await query.edit_message_text(
+                "🔍 Search User\n\nSend the User ID to search for:\n\nExample: 123456789",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_users")]])
+            )
+            context.user_data['admin_action'] = 'search_user'
+            
+        elif data == "admin_ban_user_input":
+            await query.edit_message_text(
+                "⛔ Ban User\n\nSend the User ID to ban:\n\nExample: 123456789",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_users")]])
+            )
+            context.user_data['admin_action'] = 'ban_user'
+            
+        elif data == "admin_unban_user_input":
+            await query.edit_message_text(
+                "✅ Unban User\n\nSend the User ID to unban:\n\nExample: 123456789",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_users")]])
+            )
+            context.user_data['admin_action'] = 'unban_user'
+            
+        elif data.startswith("admin_approve_ban_"):
+            user_id_to_ban = data.split("_")[-1]
+            
+            # Apply permanent ban
+            banned_users = load_json_file('data/banned_users.json', {})
+            ban_history = load_json_file('data/user_ban_history.json', {})
+            
+            current_time = time.time()
+            banned_users[user_id_to_ban] = {
+                'banned_at': current_time,
+                'ban_type': 'permanent',
+                'duration': 0,
+                'reason': 'Permanent ban approved by admin',
+                'username': banned_users.get(user_id_to_ban, {}).get('username', f'User{user_id_to_ban}'),
+                'admin_approved': True
+            }
+            
+            save_json_file('data/banned_users.json', banned_users)
+            
+            # Notify user of permanent ban
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user_id_to_ban),
+                    text="🚫 You have been permanently banned from this service.\n\nThis decision has been reviewed and approved by our administration team."
+                )
+            except:
+                pass  # User might have blocked bot
+            
+            await query.edit_message_text(
+                f"✅ Permanent ban approved for User ID: {user_id_to_ban}\n\nThe user has been permanently banned and notified.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Users", callback_data="admin_users")]])
+            )
+            
+        elif data.startswith("admin_deny_ban_"):
+            user_id_to_unban = data.split("_")[-1]
+            
+            # Remove from banned users
+            banned_users = load_json_file('data/banned_users.json', {})
+            if user_id_to_unban in banned_users:
+                del banned_users[user_id_to_unban]
+                save_json_file('data/banned_users.json', banned_users)
+            
+            # Reset ban history
+            ban_history = load_json_file('data/user_ban_history.json', {})
+            if user_id_to_unban in ban_history:
+                ban_history[user_id_to_unban]['permanent_ban_requested'] = False
+                save_json_file('data/user_ban_history.json', ban_history)
+            
+            # Notify user of appeal success with warning
+            try:
+                await context.bot.send_message(
+                    chat_id=int(user_id_to_unban),
+                    text="✅ Good news! Your ban appeal has been approved.\n\nYou can now use our services again.\n\n⚠️ WARNING: This is your final chance. Don't abuse our services again, otherwise you will get banned permanently with no further appeals."
+                )
+            except:
+                pass  # User might have blocked bot
+            
+            await query.edit_message_text(
+                f"✅ Ban denied for User ID: {user_id_to_unban}\n\nThe user has been unbanned and notified.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Users", callback_data="admin_users")]])
+            )
+            
+        elif data == "admin_detailed_stats":
+            import datetime
+            import os
+            import platform
+            
+            try:
+                # Get detailed system information with error handling
+                cpu_count = psutil.cpu_count() if hasattr(psutil, 'cpu_count') else 'N/A'
+                
+                try:
+                    boot_time = datetime.datetime.fromtimestamp(psutil.boot_time())
+                    boot_time_str = boot_time.strftime('%Y-%m-%d %H:%M')
+                except:
+                    boot_time_str = 'N/A'
+                
+                try:
+                    memory = psutil.virtual_memory()
+                    available_gb = memory.available // 1024**3
+                    cached_gb = getattr(memory, 'cached', 0) // 1024**3
+                except:
+                    available_gb = 'N/A'
+                    cached_gb = 'N/A'
+                
+                try:
+                    swap_percent = psutil.swap_memory().percent
+                except:
+                    swap_percent = 0
+                
+                try:
+                    data_files = len([f for f in os.listdir('data') if f.endswith('.json')]) if os.path.exists('data') else 0
+                    log_files = len([f for f in os.listdir('.') if f.endswith('.log')])
+                    total_files = sum(len(files) for _, _, files in os.walk('.'))
+                except:
+                    data_files = 'N/A'
+                    log_files = 'N/A'
+                    total_files = 'N/A'
+                
+                refresh_time = datetime.datetime.now().strftime('%H:%M:%S')
+                
+                detailed_text = f"""📊 Detailed System Statistics
+
+🖥️ Hardware
+├─ CPU Cores: {cpu_count}
+├─ Boot Time: {boot_time_str}
+└─ Architecture: {platform.machine()}
+
+💾 Memory Details
+├─ Available: {available_gb}GB
+├─ Cached: {cached_gb}GB
+└─ Swap: {swap_percent:.1f}%
+
+📁 File System
+├─ Data Files: {data_files}
+├─ Log Files: {log_files}
+└─ Total Files: {total_files}
+
+🕐 Last Updated: {refresh_time}"""
+                
+            except Exception as e:
+                detailed_text = f"""📊 Detailed System Statistics
+
+⚠️ Error loading detailed stats
+Please try again or contact support.
+
+🕐 Last Attempt: {datetime.datetime.now().strftime('%H:%M:%S')}"""
+            
+            keyboard = [
+                [InlineKeyboardButton("🔄 Refresh", callback_data="admin_detailed_stats")],
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_system_status")]
+            ]
+            await query.edit_message_text(detailed_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        elif data == "admin_panel":
+            # Return to main admin panel
+            conversation_histories = load_json_file('data/conversation_histories.json', {})
+            banned_users = load_json_file('data/banned_users.json', {})
+            redeem_codes = load_json_file('data/redeem_codes.json', {})
+            pricing_config = load_json_file('data/pricing_config.json', {'usd_amount': 35.0, 'stars_amount': 2500})
+            
+            total_users = len(conversation_histories) if isinstance(conversation_histories, dict) else 0
+            banned_count = len(banned_users) if isinstance(banned_users, dict) else 0
+            active_users = total_users - banned_count
+            
+            active_codes = 0
+            used_codes = 0
+            if isinstance(redeem_codes, dict):
+                for code_info in redeem_codes.values():
+                    if isinstance(code_info, dict):
+                        if code_info.get('status') == 'active':
+                            active_codes += 1
+                        elif code_info.get('status') == 'used':
+                            used_codes += 1
+            
+            revenue = used_codes * pricing_config.get('usd_amount', 35.0)
+            cpu_percent = psutil.cpu_percent()
+            memory = psutil.virtual_memory()
+            
+            admin_text = f"""🛠️ Admin Control Panel
+
+📊 Real-Time Dashboard
+┌─ Total Users: {total_users:,}
+├─ Active Users: {active_users:,}
+├─ Banned Users: {banned_count}
+├─ Active Codes: {active_codes}
+├─ Used Codes: {used_codes}
+├─ Revenue: ${revenue:,.0f}
+├─ CPU Usage: {cpu_percent:.1f}%
+└─ Memory: {memory.percent:.1f}%
+
+🎛️ Management Tools"""
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("🎫 Redeem Codes", callback_data="admin_redeem_codes"),
+                    InlineKeyboardButton("👥 User Management", callback_data="admin_users")
+                ],
+                [
+                    InlineKeyboardButton("📢 Broadcasts", callback_data="admin_broadcasts"),
+                    InlineKeyboardButton("💰 Payment Monitor", callback_data="admin_payments")
+                ],
+                [
+                    InlineKeyboardButton("💵 Pricing Config", callback_data="admin_pricing_config"),
+                    InlineKeyboardButton("📊 System Status", callback_data="admin_system_status")
+                ]
+            ]
+            
+            await query.edit_message_text(admin_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+    except Exception as e:
+        logger.error(f"Admin callback error: {e}")
+        await query.edit_message_text(
+            "⚠️ Error\n\nSomething went wrong. Please try again.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="admin_panel")]])
+        )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle regular messages with smart admin-AI handoff and media support"""
+    if not update.message or not update.effective_user:
+        return
+    
+    user_id = update.effective_user.id
+    username = update.effective_user.first_name or update.effective_user.username or f"User{user_id}"
+    message_text = update.message.text or ""
+    
+    # Check if user is banned (skip admins)
+    if not is_admin(user_id):
+        banned_users = load_json_file('data/banned_users.json', {})
+        logger.info(f"Checking ban status for user {user_id}, banned_users: {banned_users}")
+        
+        if str(user_id) in banned_users:
+            ban_info = banned_users[str(user_id)]
+            logger.info(f"User {user_id} is banned: {ban_info}")
+            
+            # Always block banned users regardless of ban type
+            await update.message.reply_text("🚫 You are banned from using this bot. Contact support if you believe this is an error.")
+            return
+    
+    # Handle admin actions
+    if is_admin(user_id) and 'admin_action' in context.user_data:
+        action = context.user_data['admin_action']
+        
+        if action == 'adding_code' and message_text:
+            code = message_text.strip()
+            redeem_codes = load_json_file('data/redeem_codes.json', {})
+            
+            if code in redeem_codes:
+                await update.message.reply_text(
+                    f"❌ Code already exists: {code}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_redeem_codes")]])
+                )
+            else:
+                redeem_codes[code] = {
+                    'status': 'active',
+                    'created_at': time.time(),
+                    'created_by': user_id
+                }
+                save_json_file('data/redeem_codes.json', redeem_codes)
+                
+                await update.message.reply_text(
+                    f"✅ Code added successfully: {code}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("➕ Add Another", callback_data="admin_add_code")],
+                        [InlineKeyboardButton("🔙 Back to Codes", callback_data="admin_redeem_codes")]
+                    ])
+                )
+            
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action == 'delete_code' and message_text:
+            code_to_delete = message_text.strip()
+            redeem_codes_data = load_json_file('data/redeem_codes.json', {})
+            
+            # Check both formats - codes array and direct entries
+            code_found = False
+            
+            # Check direct entries format
+            if code_to_delete in redeem_codes_data and isinstance(redeem_codes_data[code_to_delete], dict):
+                del redeem_codes_data[code_to_delete]
+                code_found = True
+            
+            # Check array format
+            if 'codes' in redeem_codes_data and isinstance(redeem_codes_data['codes'], list):
+                for i, code_obj in enumerate(redeem_codes_data['codes']):
+                    if isinstance(code_obj, dict) and code_obj.get('code') == code_to_delete:
+                        redeem_codes_data['codes'].pop(i)
+                        code_found = True
+                        break
+            
+            if code_found:
+                save_json_file('data/redeem_codes.json', redeem_codes_data)
+                await update.message.reply_text(
+                    f"✅ Code deleted successfully: {code_to_delete}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🗑️ Delete Another", callback_data="admin_delete_code")],
+                        [InlineKeyboardButton("📋 View All Codes", callback_data="admin_view_codes")],
+                        [InlineKeyboardButton("🔙 Back to Codes", callback_data="admin_redeem_codes")]
+                    ])
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Code not found: {code_to_delete}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🗑️ Try Again", callback_data="admin_delete_code")],
+                        [InlineKeyboardButton("📋 View All Codes", callback_data="admin_view_codes")]
+                    ])
+                )
+            
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action == 'ban_user' and message_text:
+            try:
+                target_user_id = int(message_text.strip())
+                banned_users = load_json_file('data/banned_users.json', {})
+                
+                banned_users[str(target_user_id)] = {
+                    'banned_at': time.time(),
+                    'banned_by': user_id,
+                    'reason': 'Admin ban',
+                    'type': 'permanent'
+                }
+                save_json_file('data/banned_users.json', banned_users)
+                
+                await update.message.reply_text(
+                    f"✅ User {target_user_id} has been banned permanently.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⛔ Ban Another", callback_data="admin_ban_user_input")],
+                        [InlineKeyboardButton("🔙 Back to Users", callback_data="admin_users")]
+                    ])
+                )
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Invalid User ID. Please send a valid number.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_users")]])
+                )
+            
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action == 'unban_user' and message_text:
+            try:
+                target_user_id = int(message_text.strip())
+                banned_users = load_json_file('data/banned_users.json', {})
+                
+                if str(target_user_id) in banned_users:
+                    del banned_users[str(target_user_id)]
+                    save_json_file('data/banned_users.json', banned_users)
+                    
+                    # Send warning notification to unbanned user
+                    try:
+                        await context.bot.send_message(
+                            chat_id=target_user_id,
+                            text="✅ Good news! You have been unbanned and can now use our services again.\n\n⚠️ WARNING: Don't abuse our services again, otherwise you will get banned permanently with no further appeals."
+                        )
+                    except:
+                        pass  # User might have blocked bot
+                    
+                    await update.message.reply_text(
+                        f"✅ User {target_user_id} has been unbanned successfully and notified with warning.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("✅ Unban Another", callback_data="admin_unban_user_input")],
+                            [InlineKeyboardButton("🔙 Back to Users", callback_data="admin_users")]
+                        ])
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"❌ User {target_user_id} is not banned.",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_users")]])
+                    )
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Invalid User ID. Please send a valid number.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_users")]])
+                )
+            
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action == 'configure_oxapay' and message_text:
+            api_key = message_text.strip()
+            oxapay_config = load_json_file('data/oxapay_config.json', {})
+            oxapay_config['api_key'] = api_key
+            save_json_file('data/oxapay_config.json', oxapay_config)
+            
+            await update.message.reply_text(
+                f"✅ OxaPay API key configured successfully!\n\nKey: ***{api_key[-4:]}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💳 Test Connection", callback_data="admin_test_oxapay")],
+                    [InlineKeyboardButton("🔙 Back to Settings", callback_data="admin_payment_settings")]
+                ])
+            )
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action == 'set_paid_post_url' and message_text:
+            url = message_text.strip()
+            if not url.startswith('https://t.me/'):
+                await update.message.reply_text(
+                    "❌ Invalid URL format. Must be a Telegram link starting with https://t.me/",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_payment_settings")]])
+                )
+            else:
+                stars_config = load_json_file('data/stars_config.json', {})
+                stars_config['paid_post_url'] = url
+                save_json_file('data/stars_config.json', stars_config)
+                
+                await update.message.reply_text(
+                    f"✅ Paid post URL configured successfully!\n\nURL: {url}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⭐ Setup Channel", callback_data="admin_setup_stars")],
+                        [InlineKeyboardButton("🔙 Back to Settings", callback_data="admin_payment_settings")]
+                    ])
+                )
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action == 'configure_stars_channel' and message_text:
+            try:
+                channel_id = message_text.strip()
+                if not channel_id.startswith('-100'):
+                    await update.message.reply_text(
+                        "❌ Invalid Channel ID format. Must start with -100",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_setup_stars")]])
+                    )
+                else:
+                    stars_config = load_json_file('data/stars_config.json', {})
+                    stars_config['channel_id'] = channel_id
+                    save_json_file('data/stars_config.json', stars_config)
+                    
+                    await update.message.reply_text(
+                        f"✅ Stars channel configured successfully!\n\nChannel ID: {channel_id}",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⭐ Test Setup", callback_data="admin_test_stars")],
+                            [InlineKeyboardButton("🔙 Back to Settings", callback_data="admin_payment_settings")]
+                        ])
+                    )
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ Error configuring channel: {str(e)}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_setup_stars")]])
+                )
+                
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action == 'change_usd' and message_text:
+            try:
+                new_amount = float(message_text.strip())
+                if new_amount <= 0:
+                    await update.message.reply_text(
+                        "❌ Amount must be greater than 0",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_pricing_config")]])
+                    )
+                else:
+                    pricing_config = load_json_file('data/pricing_config.json', {})
+                    pricing_config['usd_amount'] = new_amount
+                    save_json_file('data/pricing_config.json', pricing_config)
+                    
+                    await update.message.reply_text(
+                        f"✅ USD price updated to ${new_amount:.2f}",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⭐ Change Stars", callback_data="admin_change_stars")],
+                            [InlineKeyboardButton("🔙 Back to Pricing", callback_data="admin_pricing_config")]
+                        ])
+                    )
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Invalid amount. Please enter a valid number.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_pricing_config")]])
+                )
+                
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action == 'change_stars' and message_text:
+            try:
+                new_stars = int(message_text.strip())
+                if new_stars <= 0:
+                    await update.message.reply_text(
+                        "❌ Stars amount must be greater than 0",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_pricing_config")]])
+                    )
+                else:
+                    pricing_config = load_json_file('data/pricing_config.json', {})
+                    pricing_config['stars_amount'] = new_stars
+                    save_json_file('data/pricing_config.json', pricing_config)
+                    
+                    await update.message.reply_text(
+                        f"✅ Stars price updated to {new_stars:,} ⭐",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("💵 Change USD", callback_data="admin_change_usd")],
+                            [InlineKeyboardButton("🔙 Back to Pricing", callback_data="admin_pricing_config")]
+                        ])
+                    )
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Invalid amount. Please enter a valid number.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_pricing_config")]])
+                )
+                
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action == 'configure_oxapay' and message_text:
+            try:
+                api_key = message_text.strip()
+                if len(api_key) < 10:
+                    await update.message.reply_text(
+                        "❌ API key seems too short. Please enter a valid OxaPay API key.",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_payment_settings")]])
+                    )
+                else:
+                    oxapay_config = load_json_file('data/oxapay_config.json', {})
+                    oxapay_config['api_key'] = api_key
+                    save_json_file('data/oxapay_config.json', oxapay_config)
+                    
+                    await update.message.reply_text(
+                        "✅ OxaPay API key configured successfully!",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("💳 Test Connection", callback_data="admin_test_oxapay")],
+                            [InlineKeyboardButton("🔙 Back to Settings", callback_data="admin_payment_settings")]
+                        ])
+                    )
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ Error saving API key: {str(e)}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_payment_settings")]])
+                )
+                
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action == 'set_paid_post_url' and message_text:
+            try:
+                url = message_text.strip()
+                if not url.startswith('https://t.me/'):
+                    await update.message.reply_text(
+                        "❌ Invalid URL format. Must start with https://t.me/",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_payment_settings")]])
+                    )
+                else:
+                    stars_config = load_json_file('data/stars_config.json', {})
+                    stars_config['paid_post_url'] = url
+                    save_json_file('data/stars_config.json', stars_config)
+                    
+                    await update.message.reply_text(
+                        f"✅ Paid post URL configured successfully!\n\nURL: {url}",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⭐ Test Stars Setup", callback_data="admin_setup_stars")],
+                            [InlineKeyboardButton("🔙 Back to Settings", callback_data="admin_payment_settings")]
+                        ])
+                    )
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ Error saving URL: {str(e)}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_payment_settings")]])
+                )
+                
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action == 'search_user' and message_text:
+            try:
+                target_user_id = int(message_text.strip())
+                conversation_histories = load_json_file('data/conversation_histories.json', {})
+                banned_users = load_json_file('data/banned_users.json', {})
+                
+                if str(target_user_id) in conversation_histories:
+                    history = conversation_histories[str(target_user_id)]
+                    is_banned = str(target_user_id) in banned_users
+                    ban_status = "⛔ Banned" if is_banned else "✅ Active"
+                    
+                    # Get last activity
+                    last_activity = "Never"
+                    if isinstance(history, list) and history:
+                        last_msg = history[-1]
+                        if isinstance(last_msg, dict) and 'timestamp' in last_msg:
+                            ts = last_msg['timestamp']
+                            if ts and str(ts).replace('.', '').isdigit():
+                                import datetime
+                                try:
+                                    dt = datetime.datetime.fromtimestamp(float(ts))
+                                    last_activity = dt.strftime('%Y-%m-%d %H:%M')
+                                except (ValueError, OSError):
+                                    last_activity = 'Invalid'
+                    
+                    message_count = len(history) if isinstance(history, list) else 0
+                    
+                    user_info = f"""🔍 User Search Results
+
+👤 User ID: {target_user_id}
+📊 Status: {ban_status}
+💬 Messages: {message_count}
+📅 Last Activity: {last_activity}
+
+🛠️ Actions"""
+                    
+                    keyboard = [
+                        [
+                            InlineKeyboardButton("⛔ Ban User", callback_data="admin_ban_user_input"),
+                            InlineKeyboardButton("✅ Unban User", callback_data="admin_unban_user_input")
+                        ],
+                        [
+                            InlineKeyboardButton("📤 Send Code", callback_data="admin_send_code_smart"),
+                            InlineKeyboardButton("🔍 Search Another", callback_data="admin_search_user")
+                        ],
+                        [InlineKeyboardButton("🔙 Back to Users", callback_data="admin_users")]
+                    ]
+                    
+                    await update.message.reply_text(
+                        user_info,
+                        reply_markup=InlineKeyboardMarkup(keyboard)
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"❌ User {target_user_id} not found in database.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔍 Search Another", callback_data="admin_search_user")],
+                            [InlineKeyboardButton("🔙 Back to Users", callback_data="admin_users")]
+                        ])
+                    )
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Invalid User ID. Please send a valid number.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_users")]])
+                )
+            
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action == 'send_code' and message_text:
+            try:
+                target_user_id = int(message_text.strip())
+                redeem_codes = load_json_file('data/redeem_codes.json', {})
+                
+                # Find first available code
+                available_code = None
+                for code, info in redeem_codes.items():
+                    if isinstance(info, dict) and info.get('status') == 'active':
+                        available_code = code
+                        break
+                
+                if available_code:
+                    # Mark code as used
+                    redeem_codes[available_code]['status'] = 'used'
+                    redeem_codes[available_code]['used_by'] = target_user_id
+                    redeem_codes[available_code]['used_at'] = time.time()
+                    save_json_file('data/redeem_codes.json', redeem_codes)
+                    
+                    # Send code to user
+                    try:
+                        await context.bot.send_message(
+                            chat_id=target_user_id,
+                            text=f"🎉 You've received a premium access code!\n\nCode: `{available_code}`\n\nRedeem at: https://cpanda.app"
+                        )
+                        
+                        await update.message.reply_text(
+                            f"✅ Code sent to User {target_user_id}\nCode: {available_code}",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("📤 Send Another", callback_data="admin_send_code_smart")],
+                                [InlineKeyboardButton("🔙 Back to Codes", callback_data="admin_redeem_codes")]
+                            ])
+                        )
+                    except Exception as e:
+                        await update.message.reply_text(
+                            f"❌ Failed to send code to user. User may have blocked the bot.\nCode: {available_code}",
+                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_redeem_codes")]])
+                        )
+                else:
+                    await update.message.reply_text(
+                        "❌ No available codes. Please add codes first.",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_redeem_codes")]])
+                    )
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Invalid User ID. Please send a valid number.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_redeem_codes")]])
+                )
+            
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action in ['broadcast_all', 'broadcast_premium'] and message_text:
+            conversation_histories = load_json_file('data/conversation_histories.json', {})
+            redeem_codes = load_json_file('data/redeem_codes.json', {})
+            
+            if action == 'broadcast_premium':
+                # Get premium users (those who used codes)
+                premium_users = set()
+                for info in redeem_codes.values():
+                    if isinstance(info, dict) and info.get('used_by'):
+                        premium_users.add(str(info['used_by']))
+                target_users = premium_users
+            else:
+                target_users = set(conversation_histories.keys())
+            
+            sent_count = 0
+            failed_count = 0
+            
+            for target_user_id in target_users:
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(target_user_id),
+                        text=f"📢 Panda AppStore Announcement\n\n{message_text}"
+                    )
+                    sent_count += 1
+                    await asyncio.sleep(0.1)  # Rate limiting
+                except Exception:
+                    failed_count += 1
+            
+            broadcast_type = "premium users" if action == 'broadcast_premium' else "all users"
+            await update.message.reply_text(
+                f"✅ Broadcast completed!\n\nSent to: {sent_count} {broadcast_type}\nFailed: {failed_count}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 Send Another", callback_data=f"admin_{action}")],
+                    [InlineKeyboardButton("🔙 Back to Broadcasts", callback_data="admin_broadcasts")]
+                ])
+            )
+            
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action == 'change_usd' and message_text:
+            try:
+                new_amount = float(message_text.strip())
+                if new_amount <= 0:
+                    raise ValueError("Amount must be positive")
+                
+                pricing_config = load_json_file('data/pricing_config.json', {})
+                pricing_config['usd_amount'] = new_amount
+                save_json_file('data/pricing_config.json', pricing_config)
+                
+                await update.message.reply_text(
+                    f"✅ USD price updated to ${new_amount:.2f}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⭐ Change Stars", callback_data="admin_change_stars")],
+                        [InlineKeyboardButton("🔙 Back to Pricing", callback_data="admin_pricing_config")]
+                    ])
+                )
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Invalid amount. Please send a valid number (e.g., 40.00)",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_pricing_config")]])
+                )
+            
+            context.user_data.pop('admin_action', None)
+            return
+            
+        elif action == 'change_stars' and message_text:
+            try:
+                new_amount = int(message_text.strip())
+                if new_amount <= 0:
+                    raise ValueError("Amount must be positive")
+                
+                pricing_config = load_json_file('data/pricing_config.json', {})
+                pricing_config['stars_amount'] = new_amount
+                save_json_file('data/pricing_config.json', pricing_config)
+                
+                await update.message.reply_text(
+                    f"✅ Stars price updated to {new_amount} ⭐",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("💵 Change USD", callback_data="admin_change_usd")],
+                        [InlineKeyboardButton("🔙 Back to Pricing", callback_data="admin_pricing_config")]
+                    ])
+                )
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Invalid amount. Please send a valid number (e.g., 3000)",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_pricing_config")]])
+                )
+            
+            context.user_data.pop('admin_action', None)
+            return
+    
+    # Check if this is an admin reply in a forum thread
+    await check_admin_reply(update, context)
+    
+    # Skip AI for admins unless they're asking questions
+    if is_admin(user_id):
+        return
+    
+    # Check for word repetition first
+    word_check = check_word_repetition(user_id, message_text)
+    
+    if word_check['needs_warning'] and not word_check['needs_ban']:
+        # Send warning for 3 repetitions
+        warning_msg = send_warning_message(user_id, word_check['repeated_word'], word_check['max_count'])
+        await update.message.reply_text(warning_msg)
+        return
+    
+    # Check for ban conditions (word repetition or spam)
+    needs_ban = False
+    ban_reason = ""
+    
+    if word_check['needs_ban']:
+        needs_ban = True
+        ban_reason = f"Excessive word repetition: '{word_check['repeated_word']}' repeated {word_check['max_count']} times"
+    elif is_spam_message(user_id, message_text):
+        needs_ban = True
+        ban_reason = "Automatic spam detection"
+    
+    if needs_ban:
+        ban_result = ban_user_progressive(user_id, username, ban_reason)
+        
+        if ban_result['ban_type'] == 'permanent_pending':
+            # Permanent ban pending admin approval
+            await update.message.reply_text(
+                f"⚠️ You have been flagged for permanent ban (offense #{ban_result['ban_count']}).\n\nAn admin will review your case. Please contact our support team."
+            )
+            
+            # Notify admin for permanent ban approval
+            try:
+                await context.bot.send_message(
+                    chat_id=GROUP_ID,
+                    text=f"🚨 PERMANENT BAN REQUEST\n\nUser: {username} (ID: {user_id})\nOffense #{ban_result['ban_count']}\nReason: {ban_reason}\n\nPlease review and approve/deny permanent ban.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("✅ Approve Ban", callback_data=f"admin_approve_ban_{user_id}"),
+                            InlineKeyboardButton("❌ Deny Ban", callback_data=f"admin_deny_ban_{user_id}")
+                        ]
+                    ])
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify admin group: {e}")
+        else:
+            # Temporary ban
+            await update.message.reply_text(
+                f"⚠️ You have been temporarily banned for {ban_result['duration_text']} (offense #{ban_result['ban_count']}).\n\nReason: {ban_reason}\n\nIf you believe this is an error, please contact our support team."
+            )
+            
+            # Notify admin group
+            try:
+                await context.bot.send_message(
+                    chat_id=GROUP_ID,
+                    text=f"🚫 Auto-ban: User {username} (ID: {user_id}) banned for {ban_result['duration_text']} (offense #{ban_result['ban_count']})\nReason: {ban_reason}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify admin group: {e}")
+        
+        return
+    
+    # Update user's last message timestamp
+    update_user_last_message(user_id)
+    
+    # Check if admin is actively responding or if AI should take over after 20 seconds
+    if is_admin_actively_responding(user_id) and not should_ai_respond_after_timeout(user_id):
+        # Forward user message to admin thread and return
+        await forward_user_message_to_admin_thread(context, user_id, username, message_text)
+        return  # Let admin handle the conversation
+    
+    # AI Response with realistic typing
+    try:
+        await send_realistic_typing(context, update.effective_chat.id, "Thinking...")
+        
+        # Get AI response with conversation context
+        conversation_histories = load_json_file('data/conversation_histories.json', {})
+        user_history = conversation_histories.get(str(user_id), [])
+        
+        # Add current message to history
+        user_history.append({
+            'role': 'user',
+            'content': message_text,
+            'timestamp': time.time()
+        })
+        
+        # Keep only last 10 messages for context
+        if len(user_history) > 10:
+            user_history = user_history[-10:]
+        
+        # Prepare messages for OpenAI
+        messages = [
+            {
+                "role": "system",
+                "content": f"""You are a professional customer service agent for Panda AppStore, a premium iOS app service that provides modded/premium apps for iPhones without jailbreak.
+
+IMPORTANT: Only respond to questions about Panda AppStore services, pricing, apps, technical support, or related topics. For ANY other topics (general questions, homework, coding help, news, weather, personal advice, etc.), politely decline and redirect to our services.
+
+Service Details:
+- Premium Plan: ONE YEAR access for $35 USD or 2500 Telegram Stars
+- Key apps: CarX Street (unlimited money), Car Parking Multiplayer (all cars), Spotify++, YouTube++, Instagram++
+- 200+ premium apps included
+- Device-specific optimization for iPhones
+- No jailbreak required
+- 3-month revoke guarantee
+- Complete catalog: https://cpanda.app/page/ios-subscriptions
+
+For specific app inquiries, direct users to the complete app collection at: https://cpanda.app/page/ios-subscriptions
+
+When users ask about free content, promote the earning bot: https://t.me/PandaStoreFreebot
+
+For CarX Street specifically, explain it's included in the $35 yearly plan and mention the earning bot as an alternative.
+
+Respond naturally and conversationally, like a helpful human agent. Keep responses focused, helpful, and professional."""
+            }
+        ]
+        
+        # Add conversation history
+        for msg in user_history[-5:]:  # Last 5 messages for context
+            messages.append({
+                "role": msg.get('role', 'user'),
+                "content": msg.get('content', '')
+            })
+        
+        # Check if OpenAI client is available
+        if not client:
+            raise Exception("OpenAI client not initialized")
+            
+        # Get AI response
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            max_tokens=300,
+            temperature=0.7
+        )
+        
+        ai_response = response.choices[0].message.content
+        
+        # Add AI response to history
+        user_history.append({
+            'role': 'assistant',
+            'content': ai_response,
+            'timestamp': time.time()
+        })
+        
+        # Save updated history
+        conversation_histories[str(user_id)] = user_history
+        save_json_file('data/conversation_histories.json', conversation_histories)
+        
+        # Check for earning bot promotion
+        needs_earning_bot_keyboard = detect_free_content_request(message_text)
+        
+        if needs_earning_bot_keyboard:
+            keyboard = [[InlineKeyboardButton("🎁 Try Earning Bot", url="https://t.me/PandaStoreFreebot")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+        else:
+            reply_markup = None
+        
+        await update.message.reply_text(ai_response, reply_markup=reply_markup)
+        
+        # Forward conversation to admin thread
+        await forward_conversation_to_admin_thread(context, user_id, username, message_text, ai_response)
+        
+    except Exception as e:
+        logger.error(f"AI response error: {e}")
+        await update.message.reply_text(
+            "I'm having trouble processing your message right now. Please try again in a moment or contact our support team."
+        )
+
+async def forward_conversation_to_admin_thread(context, user_id: int, username: str, user_message: str, ai_response: str):
+    """Forward complete conversation (user + AI) to individual customer thread"""
+    try:
+        # Get proper user profile name
+        try:
+            user_info = await context.bot.get_chat(user_id)
+            if user_info.first_name:
+                if user_info.last_name:
+                    profile_name = f"{user_info.first_name} {user_info.last_name}"
+                else:
+                    profile_name = user_info.first_name
+            elif user_info.username:
+                profile_name = f"@{user_info.username}"
+            else:
+                profile_name = f"Customer{user_id}"
+        except Exception:
+            profile_name = username if username and username != "None" else f"Customer{user_id}"
+        
+        thread_id = await get_or_create_thread_id(context, user_id, profile_name)
+        
+        if thread_id:
+            conversation_text = f"👤 {profile_name}: {user_message}\n\n🤖 AI: {ai_response}"
+            
+            await context.bot.send_message(
+                chat_id=GROUP_ID,
+                message_thread_id=thread_id,
+                text=conversation_text
+            )
+            logger.info(f"Forwarded conversation to thread {thread_id} for user {user_id}")
+        else:
+            # Fallback: send to general chat with clear identification
+            await context.bot.send_message(
+                chat_id=GROUP_ID,
+                text=f"💬 {profile_name} (ID: {user_id})\n\n👤 Customer: {user_message}\n\n🤖 AI: {ai_response}"
+            )
+            logger.warning(f"Used fallback general chat for user {user_id} - forum topics may not be supported")
+            
+    except Exception as e:
+        logger.error(f"Error forwarding conversation to admin thread: {e}")
+
+async def get_or_create_thread_id(context, user_id: int, username: str) -> int:
+    """Create individual forum thread for each customer with proper profile name"""
+    try:
+        active_threads = load_json_file('data/active_threads.json', {})
+        user_key = str(user_id)
+        
+        # Check if thread already exists and is valid
+        if user_key in active_threads:
+            # Handle both old format (dict) and new format (int)
+            if isinstance(active_threads[user_key], dict):
+                thread_id = active_threads[user_key].get('thread_id')
+            else:
+                thread_id = active_threads[user_key]
+                
+            if thread_id:
+                try:
+                    # Test if thread still exists by sending a test message
+                    test_msg = await context.bot.send_message(
+                        chat_id=GROUP_ID,
+                        message_thread_id=thread_id,
+                        text="🔄"
+                    )
+                    # Delete the test message immediately
+                    await context.bot.delete_message(chat_id=GROUP_ID, message_id=test_msg.message_id)
+                    logger.info(f"Using existing thread {thread_id} for user {user_id}")
+                    return thread_id
+                except Exception as e:
+                    logger.warning(f"Thread {thread_id} for user {user_id} no longer exists: {e}")
+                    # Thread doesn't exist anymore, remove from tracking
+                    del active_threads[user_key]
+                    save_json_file('data/active_threads.json', active_threads)
+        
+        # Get proper user profile name from Telegram
+        try:
+            user_info = await context.bot.get_chat(user_id)
+            if user_info.first_name:
+                if user_info.last_name:
+                    profile_name = f"{user_info.first_name} {user_info.last_name}"
+                else:
+                    profile_name = user_info.first_name
+            elif user_info.username:
+                profile_name = f"@{user_info.username}"
+            else:
+                profile_name = f"Customer{user_id}"
+        except Exception as e:
+            logger.warning(f"Could not get user info for {user_id}: {e}")
+            # Fallback to provided username or generic name
+            if username and username != "None" and username.strip():
+                profile_name = username.strip()
+            else:
+                profile_name = f"Customer{user_id}"
+        
+        # Create new individual forum thread with customer's profile name
+        try:
+            logger.info(f"Creating NEW forum topic '{profile_name}' for user {user_id}")
+            
+            forum_topic = await context.bot.create_forum_topic(
+                chat_id=GROUP_ID,
+                name=profile_name
+            )
+            
+            thread_id = forum_topic.message_thread_id
+            # Store as simple integer for new format
+            active_threads[user_key] = thread_id
+            save_json_file('data/active_threads.json', active_threads)
+            
+            logger.info(f"✅ Successfully created forum topic {thread_id} for user {user_id} with name '{profile_name}'")
+            
+            # Send welcome message to new individual thread
+            from datetime import datetime as dt
+            await context.bot.send_message(
+                chat_id=GROUP_ID,
+                message_thread_id=thread_id,
+                text=f"👤 Customer: {profile_name}\n🆔 User ID: {user_id}\n📅 Created: {dt.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n💬 All AI conversations with this customer will appear in this dedicated thread."
+            )
+            
+            return thread_id
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to create forum topic for user {user_id}: {e}")
+            return None
+        
+    except Exception as e:
+        logger.error(f"Error in get_or_create_thread_id for user {user_id}: {e}")
+        return None
+
+async def check_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check if message is admin reply in forum thread or to customer message"""
+    if not update.message or not update.effective_user:
+        return
+    
+    user_id = update.effective_user.id
+    
+    # Only process admin messages
+    if not is_admin(user_id):
+        return
+    
+    # Check if this is a forum thread message
+    if (update.message.chat.id == GROUP_ID and 
+        hasattr(update.message, 'message_thread_id') and 
+        update.message.message_thread_id):
+        
+        thread_id = update.message.message_thread_id
+        
+        # Find which user this thread belongs to
+        active_threads = load_json_file('data/active_threads.json', {})
+        target_user_id = None
+        
+        for uid, thread_data in active_threads.items():
+            # Handle both old format (dict) and new format (int)
+            if isinstance(thread_data, dict):
+                tid = thread_data.get('thread_id')
+            else:
+                tid = thread_data
+                
+            if tid == thread_id:
+                target_user_id = int(uid)
+                break
+        
+        if target_user_id:
+            logger.info(f"Admin {user_id} replying to user {target_user_id} in thread {thread_id}")
+            
+            # Mark admin as actively responding to this user
+            mark_admin_active(target_user_id, user_id)
+            
+            # Forward admin's message to the user
+            try:
+                message_text = update.message.text or "Message from support team"
+                
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=message_text
+                )
+                
+                logger.info(f"Successfully forwarded admin message to user {target_user_id}")
+                
+                # Send confirmation to admin in thread
+                try:
+                    await context.bot.send_message(
+                        chat_id=GROUP_ID,
+                        message_thread_id=thread_id,
+                        text=f"✅ Message delivered to user"
+                    )
+                except Exception as conf_e:
+                    logger.error(f"Error sending confirmation to admin: {conf_e}")
+                
+                # Add to conversation history
+                conversation_histories = load_json_file('data/conversation_histories.json', {})
+                user_history = conversation_histories.get(str(target_user_id), [])
+                
+                user_history.append({
+                    'role': 'assistant',
+                    'content': f"[Admin] {message_text}",
+                    'timestamp': time.time(),
+                    'admin_id': user_id
+                })
+                
+                conversation_histories[str(target_user_id)] = user_history
+                save_json_file('data/conversation_histories.json', conversation_histories)
+                
+            except Exception as e:
+                logger.error(f"Error forwarding admin message to user {target_user_id}: {e}")
+                # Send error notification to admin
+                try:
+                    await context.bot.send_message(
+                        chat_id=GROUP_ID,
+                        message_thread_id=thread_id,
+                        text=f"❌ Failed to deliver message to user: {str(e)}"
+                    )
+                except:
+                    pass
+        else:
+            logger.warning(f"Could not find user for thread {thread_id}")
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    logger.error(f"Exception while handling an update: {context.error}")
+
+def main():
+    """Main function"""
+    if not BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not found in environment variables")
+        return
+    
+    # Initialize data storage
+    initialize_data()
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CallbackQueryHandler(callback_query_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.ALL, check_admin_reply))
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
+    
+    # Start the bot
+    logger.info("Starting Panda AppStore Bot...")
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    # Assign loaded users_info to bot_data
-    app.bot_data["users_info"] = users_info_loaded
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("threads", list_threads))
-    app.add_handler(CommandHandler("plan", show_user_panel))
-    # Admin text input handler (must be before generic text handler)
-    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE & filters.User(list(ADMIN_IDS)), handle_admin_action_input))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^🛒 Buy Now$"), handle_buy_now_reply))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    # Admin panel: all admin callback_data starts with these (plan_.* removed)
-    app.add_handler(CallbackQueryHandler(admin_callback_handler,
-        pattern=r"^(admin_.*|add_plan|add_codes_.*|view_codes_.*|remove_code_.*|remove_plan_.*|confirm_remove_plan_.*|add_redeem_codes.*|add_sub.*|remove_sub.*|view_redeem_codes.*|remove_redeem_code.*|users_page_.*|user_details_.*|admin_broadcast.*|admin_stats.*|admin_set_price.*|admin_update_website_data|admin_view_files|confirm_add_plan|cancel_add_plan|edit_details_.*|edit_other_payment_.*)$"))
-    # User panel: handle user_panel, pay_stars_.*, etc. (plan_.* removed)
-    app.add_handler(CallbackQueryHandler(user_callback_handler,
-        pattern=r"^(user_panel|pay_stars_.*|other_payment_.*)$"))
-    # Fallback/catch-all: route plan_.* based on admin status
-    async def plan_dispatcher(update, context):
-        user_id = update.effective_user.id
-        data = update.callback_query.data
-        if data.startswith('plan_'):
-            if user_id in ADMIN_IDS:
-                await admin_callback_handler(update, context)
-            else:
-                await user_callback_handler(update, context)
-        else:
-            # fallback to user handler for any other unmatched callback
-            await user_callback_handler(update, context)
-    app.add_handler(CallbackQueryHandler(plan_dispatcher))
-
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_photo_or_file))
-    # Update media handler with correct filters
-    app.add_handler(MessageHandler(
-        (filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.VOICE | 
-         filters.AUDIO | filters.ANIMATION) & filters.ChatType.GROUPS, 
-        handle_admin_media_reply
-    ))
-    print("✅ Human-like support bot is running...")
-    app.run_polling()
-    
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
